@@ -71,18 +71,122 @@ firebase.initializeApp(FIREBASE_CONFIG);
 const _auth = firebase.auth();
 const _fdb  = firebase.firestore();
 
-var _saveT = null;
+var _saveT = null, _afterSave = [];
+
+/* The business whose data this session reads/writes: your own, or the owner's if you joined as a team member */
+function _bizUid(){ return State.bizUid || (_auth.currentUser && _auth.currentUser.uid) || ''; }
+
 function persist() {
   clearTimeout(_saveT);
   _saveT = setTimeout(async () => {
     const user = _auth.currentUser;
-    if (!user || !State.db) return;
+    const uid  = _bizUid();
+    if (!user || !uid || !State.db) return;
     try {
-      await _fdb.collection('businesses').doc(user.uid).set(State.db);
-      // Sync public portal data (safe to expose — no customer/invoice data)
-      syncPortal(user.uid);
+      await _fdb.collection('businesses').doc(uid).set(State.db);
+      // Publish the public-safe copies used by the customer order page and the staff POS link
+      syncPortal(uid);
+      syncPosPortal(uid);
+      const cbs = _afterSave.splice(0);
+      cbs.forEach(function(f){ try{ f(); }catch(e){} });
     } catch(e) { console.error('Save error', e); }
   }, 800);
+}
+
+/* ---------- SHA-256 (small, synchronous). Used so staff PINs are never written in plain text to the public POS data ---------- */
+function _sha256(ascii){
+  function rrot(v,a){ return (v>>>a)|(v<<(32-a)); }
+  var maxWord=Math.pow(2,32), result='', i, j, words=[], bitLen=ascii.length*8;
+  var hash=_sha256.h=_sha256.h||[], k=_sha256.k=_sha256.k||[], pc=k.length, comp={};
+  for(var cand=2; pc<64; cand++){
+    if(!comp[cand]){
+      for(i=0;i<313;i+=cand) comp[i]=cand;
+      hash[pc]=(Math.pow(cand,.5)*maxWord)|0;
+      k[pc++]=(Math.pow(cand,1/3)*maxWord)|0;
+    }
+  }
+  ascii+='\x80';
+  while(ascii.length%64-56) ascii+='\x00';
+  for(i=0;i<ascii.length;i++){ j=ascii.charCodeAt(i); if(j>>8) return ''; words[i>>2]|=j<<((3-i)%4)*8; }
+  words[words.length]=((bitLen/maxWord)|0);
+  words[words.length]=bitLen;
+  for(j=0;j<words.length;){
+    var w=words.slice(j,j+=16), old=hash;
+    hash=hash.slice(0,8);
+    for(i=0;i<64;i++){
+      var w15=w[i-15], w2=w[i-2], a=hash[0], e=hash[4];
+      var t1=hash[7]+(rrot(e,6)^rrot(e,11)^rrot(e,25))+((e&hash[5])^((~e)&hash[6]))+k[i]+
+        (w[i]=(i<16)?w[i]:(w[i-16]+(rrot(w15,7)^rrot(w15,18)^(w15>>>3))+w[i-7]+(rrot(w2,17)^rrot(w2,19)^(w2>>>10)))|0);
+      var t2=(rrot(a,2)^rrot(a,13)^rrot(a,22))+((a&hash[1])^(a&hash[2])^(hash[1]&hash[2]));
+      hash=[(t1+t2)|0].concat(hash);
+      hash[4]=(hash[4]+t1)|0;
+    }
+    for(i=0;i<8;i++) hash[i]=(hash[i]+old[i])|0;
+  }
+  for(i=0;i<8;i++) for(j=3;j+1;j--){ var b=(hash[i]>>(j*8))&255; result+=((b<16)?0:'')+b.toString(16); }
+  return result;
+}
+function _sha256hex(str){ return _sha256(unescape(encodeURIComponent(String(str)))); }
+
+/* ---------- Staff POS: publish register data (items, staff names, hashed PINs) to pos_portals/{posToken} ---------- */
+function syncPosPortal(uid){
+  const db = State.db, s = db && db.settings;
+  if (!s || !s.posToken || !uid) return;
+  const tok = s.posToken;
+  const data = {
+    businessUid: uid,
+    businessName: s.businessName || '', logo: s.logo || '',
+    currencySymbol: s.currencySymbol || 'Rf', taxLabel: s.taxLabel || 'GST', taxRate: +s.taxRate || 0,
+    posPrefix: s.posPrefix || 'TXN-', updatedAt: new Date().toISOString(),
+    employees: (db.employees||[]).filter(function(e){ return e && e.active!==false; }).map(function(e){
+      return { id:e.id, name:e.name||'', role:e.role||'cashier', pinHash: e.pin ? _sha256hex(tok+':'+e.id+':'+e.pin) : '' };
+    }),
+    items: (db.items||[]).filter(function(i){ return i && i.name; }).map(function(i){
+      return { id:i.id, name:i.name, sku:i.sku||'', barcode:i.barcode||'', unit:i.unit||'pc',
+        unitPrice:+i.unitPrice||0, taxable:i.taxable!==false, trackStock:i.trackStock!==false,
+        stockQty:i.stockQty||0, reorderLevel:i.reorderLevel||0 };
+    })
+  };
+  _fdb.collection('pos_portals').doc(tok).set(data).catch(function(e){ console.warn('POS portal sync:', e.message); });
+}
+
+/* ---------- Staff POS sales arrive in businesses/{uid}/posQueue; import them into the books + deduct stock ---------- */
+var _posUnsub = null;
+function startPosQueueListener(){
+  stopPosQueueListener();
+  const uid = _bizUid(); if (!uid) return;
+  try {
+    _posUnsub = _fdb.collection('businesses').doc(uid).collection('posQueue').onSnapshot(function(snap){
+      if (!snap.empty) importPosSales(snap.docs);
+    }, function(err){ console.warn('POS queue listener:', err.message); });
+  } catch(e) { console.warn('POS queue:', e.message); }
+}
+function stopPosQueueListener(){ if (_posUnsub) { try{ _posUnsub(); }catch(e){} _posUnsub = null; } }
+function importPosSales(docs){
+  if (!State.db) return;
+  if (!Array.isArray(State.db.transactions)) State.db.transactions = [];
+  var added = 0, refs = [];
+  docs.forEach(function(d){
+    var q = d.data(), t = q && q.txn;
+    refs.push(d.ref);
+    if (!t || !t.id) return;
+    if (State.db.transactions.some(function(x){ return x.id === t.id; })) return;   // already imported
+    if (t.totals && t.totals.subtotal === undefined && t.totals.sub !== undefined) t.totals.subtotal = t.totals.sub;
+    t.source = 'staff-pos';
+    State.db.transactions.unshift(t);
+    (t.lineItems||[]).forEach(function(ci){
+      var item = State.db.items.find(function(i){ return i.id === ci.itemId; });
+      if (item && item.trackStock !== false) addStockMovement(ci.itemId, 'sale', -ci.qty, 'POS-'+t.number, 'Staff POS');
+    });
+    added++;
+  });
+  // Only remove the queue entries once the imported data is safely saved
+  _afterSave.push(function(){ refs.forEach(function(r){ r.delete().catch(function(){}); }); });
+  persist();
+  if (added) {
+    toast(added + ' staff POS sale' + (added>1?'s':'') + ' imported');
+    if (['dashboard','stock','items'].indexOf(State.view) >= 0) go(State.view);
+  }
 }
 
 // Sync order portal public data to portals/{orderToken}
@@ -141,17 +245,58 @@ function computeDaysLeft(pi) {
   const exp = pi.trialExpiry.toDate ? pi.trialExpiry.toDate() : new Date(pi.trialExpiry);
   return Math.max(0, Math.ceil((exp - new Date()) / 86400000));
 }
+/* ---------- Team invitations: accept an invite link and become a member of the owner's business ---------- */
+async function _acceptInvite(user, code){
+  const ref  = _fdb.collection('invites').doc(code);
+  const snap = await ref.get();
+  if (!snap.exists) return { ok:false, msg:'This invitation link is no longer valid.' };
+  const inv = snap.data();
+  if (inv.status !== 'pending') return { ok:false, msg:'This invitation has already been used.' };
+  const em = (user.email||'').toLowerCase();
+  if (inv.email && inv.email !== em) return { ok:false, msg:'This invitation was sent to ' + inv.email + '. Please sign in with that email address.' };
+  await _fdb.collection('members').doc(user.uid).set({
+    ownerUid: inv.ownerUid, ownerName: inv.ownerName || '', role: inv.role || 'manager',
+    email: em, name: inv.name || '', code: code, joinedAt: new Date().toISOString()
+  });
+  await ref.update({ status:'accepted', acceptedBy:user.uid, acceptedAt:new Date().toISOString() });
+  return { ok:true };
+}
+
 async function loadFirebaseUser(user) {
   try {
+    /* 1. Is this person on someone else's team? (or opening an invite link right now) */
+    let member = null, inviteNote = '';
+    try {
+      const mSnap = await _fdb.collection('members').doc(user.uid).get();
+      if (mSnap.exists) member = mSnap.data();
+    } catch(e) { console.warn('members lookup:', e.message); }
+    const code = _pendingInviteCode();
+    if (code) {
+      if (!member) {
+        const r = await _acceptInvite(user, code).catch(function(e){ return { ok:false, msg:e.message }; });
+        if (r.ok) {
+          const m2 = await _fdb.collection('members').doc(user.uid).get();
+          member = m2.exists ? m2.data() : null;
+        } else inviteNote = r.msg || '';
+      }
+      _clearPendingInvite();
+    }
+
+    /* 2. Load the business data: the owner's if you're a team member, otherwise your own */
+    const bizUid = member ? member.ownerUid : user.uid;
     const [bizSnap, planSnap, cfgSnap] = await Promise.all([
-      _fdb.collection('businesses').doc(user.uid).get(),
-      _fdb.collection('plan_info').doc(user.uid).get(),
+      _fdb.collection('businesses').doc(bizUid).get(),
+      _fdb.collection('plan_info').doc(bizUid).get().catch(()=>null),
       _fdb.collection('platform_config').doc('settings').get().catch(()=>null)
     ]);
+    if (member && !bizSnap.exists) throw new Error('The business you were invited to could not be found.');
     State.db = bizSnap.exists ? bizSnap.data() : starterDb(user.displayName||'', user.email);
-    const pi = planSnap.exists ? planSnap.data() : null;
-    const isAdmin = (user.email||'').toLowerCase() === ADMIN_EMAIL.toLowerCase();
+    const pi = (planSnap && planSnap.exists) ? planSnap.data() : null;
+    const isAdmin = !member && (user.email||'').toLowerCase() === ADMIN_EMAIL.toLowerCase();
     State.isAdmin = isAdmin;
+    State.isMember = !!member;
+    State.memberRole = member ? (member.role || 'manager') : '';
+    State.bizUid = bizUid;
     if (isAdmin) {
       // Admin always has full Pro access
       State.db.settings.plan = 'pro';
@@ -165,10 +310,13 @@ async function loadFirebaseUser(user) {
     document.getElementById('auth').style.display = 'none';
     document.getElementById('app').style.display  = 'flex';
     launchApp();
+    if (inviteNote) setTimeout(function(){ toast(inviteNote); }, 900);
+    else if (member && code) setTimeout(function(){ toast('Welcome! You have joined ' + (member.ownerName || 'the team') + '.'); }, 900);
   } catch(e) {
     document.getElementById('authErr').textContent = 'Could not load account: ' + e.message;
   }
 }
+
 _auth.onAuthStateChanged(user => {
   if (user && !State.user) loadFirebaseUser(user);
   else if (!user) {
@@ -245,10 +393,43 @@ function calcDoc(doc,db){
    AUTH
    ============================================================ */
 var authMode='register';
+/* ---------- Invite link handling on the sign-in screen ---------- */
+var _inviteInfo = null;
+(function captureInviteCode(){
+  try {
+    var q = new URLSearchParams(location.search).get('invite');
+    if (q) { localStorage.setItem('bm_invite', q); history.replaceState(null, '', location.pathname + location.hash); }
+  } catch(e) {}
+})();
+function _pendingInviteCode(){ try { return localStorage.getItem('bm_invite') || ''; } catch(e) { return ''; } }
+function _clearPendingInvite(){ try { localStorage.removeItem('bm_invite'); } catch(e) {} _inviteInfo = null; }
+async function _showInviteBanner(){
+  var code = _pendingInviteCode(); if (!code) return;
+  var host = document.getElementById('authSub'); if (!host) return;
+  var html;
+  try {
+    var snap = await _fdb.collection('invites').doc(code).get();
+    var inv = snap.exists ? snap.data() : null;
+    if (inv && inv.status === 'pending') {
+      _inviteInfo = inv;
+      var em = document.getElementById('a_email'); if (em && inv.email) em.value = inv.email;
+      html = '<div id="inviteBanner" style="background:var(--accent-soft);border:1.5px solid var(--accent);border-radius:11px;padding:11px 13px;margin-bottom:14px;font-size:13.5px">' +
+        '<b>' + esc(inv.ownerName || 'A business') + '</b> invited you to join their team' + (inv.role==='admin' ? ' as an admin' : '') + '.<br>' +
+        '<span class="muted">Create an account or sign in' + (inv.email ? ' with <b>' + esc(inv.email) + '</b>' : '') + ' to accept.</span></div>';
+    } else {
+      _clearPendingInvite();
+      html = '<div id="inviteBanner" style="background:var(--amber-soft);border:1.5px solid var(--amber);border-radius:11px;padding:11px 13px;margin-bottom:14px;font-size:13.5px">' +
+        'This invitation link is no longer valid or has already been used.</div>';
+    }
+  } catch(e) { return; }
+  host.insertAdjacentHTML('afterend', html);
+  setAuthMode(authMode);
+}
+
 function setAuthMode(m){
   authMode=m;
-  document.getElementById('regFields').style.display=m==='register'?'block':'none';
-  document.getElementById('authSub').textContent=m==='register'?'Create your business account':'Welcome back';
+  document.getElementById('regFields').style.display=(m==='register'&&!_inviteInfo)?'block':'none';
+  document.getElementById('authSub').textContent=m==='register'?(_inviteInfo?'Create your account to join the team':'Create your business account'):'Welcome back';
   document.getElementById('authBtn').textContent=m==='register'?'Create account':'Sign in';
   document.getElementById('authToggle').innerHTML=m==='register'
     ?'Already have an account? <a>Sign in</a>':"New here? <a>Create an account</a>";
@@ -256,21 +437,23 @@ function setAuthMode(m){
 }
 document.getElementById('authToggle').onclick=()=>setAuthMode(authMode==='register'?'login':'register');
 document.getElementById('authBtn').onclick = doAuth;
+_showInviteBanner();
 async function doAuth() {
   const email = document.getElementById('a_email').value.trim().toLowerCase();
   const pass  = document.getElementById('a_pass').value;
   const biz   = document.getElementById('r_biz').value.trim();
   const err   = document.getElementById('authErr');
   if (!email || !pass) { err.textContent = 'Email and password are required.'; return; }
-  if (authMode === 'register' && !biz) { err.textContent = 'Please enter your business name.'; return; }
+  if (authMode === 'register' && !biz && !_inviteInfo) { err.textContent = 'Please enter your business name.'; return; }
   const btn = document.getElementById('authBtn'), orig = btn.textContent;
   btn.disabled = true; btn.textContent = 'Please wait…'; err.textContent = '';
   try {
     if (authMode === 'register') {
       const cred = await _auth.createUserWithEmailAndPassword(email, pass);
-      await cred.user.updateProfile({ displayName: biz });
+      await cred.user.updateProfile({ displayName: biz || (_inviteInfo && _inviteInfo.name) || '' });
+      const joining = _inviteInfo && (!_inviteInfo.email || _inviteInfo.email === email);
       const trialExpiry = new Date(Date.now() + TRIAL_DAYS * 86400000);
-      await Promise.all([
+      if (!joining) await Promise.all([
         _fdb.collection('plan_info').doc(cred.user.uid).set({plan:'free', trialExpiry, createdAt:new Date(), email, businessName:biz}),
         _fdb.collection('businesses').doc(cred.user.uid).set(starterDb(biz, email))
       ]);
@@ -291,8 +474,9 @@ function launchApp(){
   if(State.db && !Array.isArray(State.db.stockAudits))    State.db.stockAudits=[];
   if(State.db && !Array.isArray(State.db.zakatRecords))   State.db.zakatRecords=[];
   // Sync public order portal on login
-  const _launchUid = _auth.currentUser && _auth.currentUser.uid;
-  if (_launchUid) setTimeout(function(){ syncPortal(_launchUid); }, 1200);
+  const _launchUid = _bizUid();
+  if (_launchUid) setTimeout(function(){ syncPortal(_launchUid); syncPosPortal(_launchUid); }, 1200);
+  startPosQueueListener();
   if(State.db && !State.db.gstSettings) State.db.gstSettings={registered:false,gstNumber:'',sector:'general',filingFrequency:'quarterly',filedReturns:[]};
   if(State.db){const s=State.db.settings;if(!s.zakatNisabStd)s.zakatNisabStd='silver';if(!s.zakatSilverPrice)s.zakatSilverPrice=32.82;if(!s.zakatGoldPrice)s.zakatGoldPrice=440;}
   const DEFAULT_UOMS=['pc','box','hr','kg','g','L','mL','m','cm','ft','dozen','ream','pair','set','service','month','day','km'];
@@ -307,10 +491,12 @@ function launchApp(){
 }
 document.getElementById('logoutBtn').onclick = async () => {
   clearTimeout(_saveT);
-  if (State.db && _auth.currentUser)
-    await _fdb.collection('businesses').doc(_auth.currentUser.uid).set(State.db).catch(()=>{});
+  stopPosQueueListener();
+  const _outUid = _bizUid();
+  if (State.db && _auth.currentUser && _outUid)
+    await _fdb.collection('businesses').doc(_outUid).set(State.db).catch(()=>{});
   await _auth.signOut();
-  State.user = null; State.db = null; State.isAdmin = false;
+  State.user = null; State.db = null; State.isAdmin = false; State.bizUid = ''; State.isMember = false;
 };
 
 /* ============================================================
@@ -333,6 +519,7 @@ function refreshChrome(){
     const key=l.dataset.featureLock;
     l.style.display=featureLocked(key)?'inline-block':'none';
   });
+  var _tn=document.querySelector('#nav a[data-view="team"]'); if(_tn) _tn.style.display=State.isMember?'none':'';
   document.getElementById('adminGroup').style.display=State.isAdmin?'block':'none';
   document.getElementById('adminLink').style.display=State.isAdmin?'flex':'none';
 }
@@ -1461,8 +1648,8 @@ function saveSettings(){
   if(val('s_pos'))s.posPrefix=val('s_pos');
   persist();
   // Keep the customer order link data (bank details, products) in sync
-  var uid=State.user&&State.user.uid;
-  if(uid) syncPortal(uid);
+  var uid=_bizUid();
+  if(uid){ syncPortal(uid); syncPosPortal(uid); }
   refreshChrome();toast('Settings saved');
 }
 
@@ -3127,7 +3314,12 @@ function showEmpLogin(emps){
         <div class="muted" style="font-size:11.5px">${e.role||'cashier'}</div>
       </div>`).join('')}
     </div>
-    <p class="muted" style="font-size:12px;margin-top:20px">Not listed? Ask the admin to add you as an employee.</p>
+    <div class="card" style="margin-top:22px;padding:13px 14px;text-align:left">
+      <b style="font-size:13px">Staff POS link</b>
+      <div class="muted" style="font-size:12px;margin:2px 0 10px">Staff open this on their own phone or tablet and sign in with their PIN.</div>
+      <div style="display:flex;gap:8px"><button class="btn accent sm" onclick="copyPosLink()">Copy link</button><button class="btn ghost sm" onclick="openPosLink()">Open ↗</button></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin-top:16px">Not listed? Ask the admin to add you as an employee.</p>
   </div>`;
 }
 var _pinInput='',_pinEmpId='';
@@ -3163,7 +3355,11 @@ function renderPOS(){
   document.getElementById('content').innerHTML=`
     <div class="pos-cashier-bar">
       <span>${svg('badge',15)} Cashier: <strong>${esc(posCashier.name)}</strong></span>
-      <button class="btn ghost tiny" onclick="posCashier=null;_posSearch='';viewPOS()">Switch</button>
+      <span style="display:flex;gap:6px;align-items:center">
+        <button class="btn ghost tiny" title="Copy the staff POS link" onclick="copyPosLink()">🔗 Staff link</button>
+        <button class="btn ghost tiny" title="Open the staff POS in a new tab" onclick="openPosLink()">Open ↗</button>
+        <button class="btn ghost tiny" onclick="posCashier=null;_posSearch='';viewPOS()">Switch</button>
+      </span>
     </div>
     ${mob?`<div class="pos-tab-bar"><button class="pos-tab ${_posTab==='items'?'active':''}" onclick="_posTab='items';renderPOS()">Items</button><button class="pos-tab ${_posTab==='cart'?'active':''}" onclick="_posTab='cart';renderPOS()">Cart (${posCart.reduce((s,c)=>s+c.qty,0)})</button></div>`:''}
     <div class="pos-wrap">
@@ -3313,79 +3509,184 @@ function viewPOSHistory(){
 /* ============================================================
    TEAM ACCESS (Pro)
    ============================================================ */
+/* ============================================================
+   TEAM ACCESS — invite by link (WhatsApp / email / copy)
+   Invites live in Firestore: invites/{code}. When the person opens the link and
+   signs in, members/{theirUid} links them to your business.
+   ============================================================ */
+var _teamInvites = [];
+
+function _randCode(n){
+  var a = new Uint8Array(n);
+  (window.crypto || window.msCrypto).getRandomValues(a);
+  return Array.prototype.map.call(a, function(b){ return (b % 36).toString(36); }).join('');
+}
+function _inviteLink(code){
+  return location.href.split(/[?#]/)[0].replace(/[^/]*$/, '') + 'index.html?invite=' + encodeURIComponent(code);
+}
+function _waNumber(p){
+  var d = String(p || '').replace(/\D/g, '');
+  if (d.indexOf('00') === 0) d = d.slice(2);
+  if (d.length === 7) d = '960' + d;            // local Maldives number
+  return d;
+}
+function _inviteBizName(){ return (State.db && State.db.settings && State.db.settings.businessName) || 'our business'; }
+function _inviteMessage(inv){
+  return 'Hi ' + (inv.name || '') + ',\n\n' + _inviteBizName() + ' has invited you to join their team on Bizz Master' +
+    (inv.role === 'admin' ? ' (admin access)' : '') + '.\n\nOpen this link to create your account or sign in' +
+    (inv.email ? ' (use ' + inv.email + ')' : '') + ':\n' + _inviteLink(inv.code);
+}
+function _waUrl(inv){ return 'https://wa.me/' + _waNumber(inv.phone) + '?text=' + encodeURIComponent(_inviteMessage(inv)); }
+function _mailUrl(inv){
+  return 'mailto:' + (inv.email || '') + '?subject=' + encodeURIComponent('Invitation to join ' + _inviteBizName() + ' on Bizz Master') +
+    '&body=' + encodeURIComponent(_inviteMessage(inv));
+}
+
 async function viewTeam(){
-  const invited=State.db.invitedUsers||[];
-  document.getElementById('content').innerHTML=`
-   <div class="between" style="margin-bottom:16px">
-     <div>
-       <p class="muted" style="font-size:13px;margin-top:3px">Invite team members to access this business portal with their own login. Pro plan only.</p>
-     </div>
-     <button class="btn accent" onclick="openInviteModal()">${svg('plus')} Invite member</button>
-   </div>
-   ${invited.length?`<div class="tbl"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead><tbody>
-     ${invited.map(u=>`<tr>
-       <td style="font-weight:600">${esc(u.name)}</td>
-       <td class="muted">${esc(u.email)}</td>
-       <td><span class="pill ${u.role==='admin'?'sent':'draft'}">${u.role||'manager'}</span></td>
-       <td><div class="rowacts"><button class="iconbtn" onclick="removeInvite('${esc(u.email)}')">${svg('trash')}</button></div></td>
-     </tr>`).join('')}
-   </tbody></table></div>`:emptyBox('No team members yet','Invite a colleague to give them access to your business portal.')}
-   <div class="card pad" style="margin-top:16px;background:var(--accent-soft);border-color:var(--accent)">
-     <b>How team access works</b>
-     <ol style="margin-top:8px;padding-left:18px;font-size:13px;line-height:1.9;color:var(--ink-soft)">
-       <li>Add the team member's email above.</li>
-       <li>They open <strong>${esc(location.origin+location.pathname.replace(/[^/]*$/,''))}</strong> and register with that exact email.</li>
-       <li>Their account automatically links to your business data on first login.</li>
-       <li>You can manage their access from this page at any time.</li>
-     </ol>
-   </div>`;
-  renderIcons(document.getElementById('content'));
+  var c = document.getElementById('content');
+  if (State.isMember) {
+    c.innerHTML = '<div class="card pad"><b>Team access is managed by the business owner.</b>' +
+      '<p class="muted" style="margin-top:6px;font-size:13px">You are signed in as a team member.</p></div>';
+    return;
+  }
+  c.innerHTML = '<div class="card pad muted" style="text-align:center">Loading team…</div>';
+  try {
+    var snap = await _fdb.collection('invites').where('ownerUid', '==', _bizUid()).get();
+    _teamInvites = snap.docs.map(function(d){ return d.data(); })
+      .sort(function(a,b){ return (b.createdAt||'') > (a.createdAt||'') ? 1 : -1; });
+  } catch(e) {
+    c.innerHTML = '<div class="card pad" style="background:var(--amber-soft);border-color:var(--amber)"><b>Could not load your team.</b><br>' +
+      esc(e.message) + '<br><small>Publish the latest firestore.rules in Firebase Console → Firestore Database → Rules.</small></div>';
+    return;
+  }
+  _renderTeam();
 }
+
+function _renderTeam(){
+  var c = document.getElementById('content'); if (!c || State.view !== 'team') return;
+  var rows = _teamInvites.map(function(u){
+    var joined = u.status === 'accepted';
+    var contact = [u.email, u.phone].filter(Boolean).map(esc).join('<br>');
+    var actions = joined ? '' :
+      '<a class="btn ghost tiny" target="_blank" rel="noopener" href="' + esc(_waUrl(u)) + '">WhatsApp</a>' +
+      (u.email ? '<a class="btn ghost tiny" href="' + esc(_mailUrl(u)) + '">Email</a>' : '') +
+      '<button class="btn ghost tiny" onclick="copyInviteLink(\'' + u.code + '\')">Copy link</button>';
+    return '<tr>' +
+      '<td style="font-weight:600">' + esc(u.name) + '</td>' +
+      '<td class="muted" style="font-size:12.5px">' + contact + '</td>' +
+      '<td><span class="pill ' + (u.role==='admin' ? 'sent' : 'draft') + '">' + esc(u.role || 'manager') + '</span></td>' +
+      '<td><span class="pill ' + (joined ? 'paid' : 'draft') + '">' + (joined ? 'Joined' : 'Invite sent') + '</span></td>' +
+      '<td><div class="rowacts" style="flex-wrap:wrap">' + actions +
+        '<button class="iconbtn" title="Remove" onclick="removeInvite(\'' + u.code + '\')">' + svg('trash') + '</button></div></td>' +
+    '</tr>';
+  }).join('');
+  c.innerHTML =
+    '<div class="between" style="margin-bottom:16px;gap:10px;flex-wrap:wrap">' +
+      '<p class="muted" style="font-size:13px;max-width:560px">Invite colleagues to use this business with their own login. Send the invitation by WhatsApp or email.</p>' +
+      '<button class="btn accent" onclick="openInviteModal()">' + svg('plus') + ' Invite member</button>' +
+    '</div>' +
+    (_teamInvites.length
+      ? '<div class="tbl"><table><thead><tr><th>Name</th><th>Contact</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+      : emptyBox('No team members yet', 'Invite a colleague to give them access to your business portal.')) +
+    '<div class="card pad" style="margin-top:16px;background:var(--accent-soft);border-color:var(--accent)">' +
+      '<b>How it works</b>' +
+      '<ol style="margin-top:8px;padding-left:18px;font-size:13px;line-height:1.9;color:var(--ink-soft)">' +
+        '<li>Click <b>Invite member</b> and enter their name plus a WhatsApp number or email.</li>' +
+        '<li>Send them the invitation link by <b>WhatsApp</b> or <b>email</b>.</li>' +
+        '<li>They open the link, create an account (or sign in) and are added to your business automatically.</li>' +
+        '<li>Remove them here at any time to cut off their access.</li>' +
+      '</ol>' +
+      '<p class="muted" style="font-size:12px;margin-top:8px">Bizz Master cannot send email on its own. The Email button opens your mail app with the message ready to send.</p>' +
+    '</div>';
+  renderIcons(c);
+}
+
 function openInviteModal(){
-  openModal('Invite team member',`
-    <div class="fgrid">
-      <div class="field"><label>Name *</label><input id="inv_name" placeholder="e.g. Ahmed Ali"></div>
-      <div class="field"><label>Email *</label><input id="inv_email" type="email" placeholder="ahmed@example.com"></div>
-      <div class="field"><label>Role</label><select id="inv_role"><option value="manager">Manager</option><option value="admin">Admin (full access)</option></select></div>
-    </div>`,
-    [{label:'Cancel',cls:'ghost',fn:closeModal},{label:'Send invite',cls:'accent',fn:async()=>{
-      const name=val('inv_name'),email=val('inv_email').toLowerCase();
-      if(!name||!email)return toast('Name and email required');
-      if(!State.db.invitedUsers)State.db.invitedUsers=[];
-      if(State.db.invitedUsers.find(u=>u.email===email))return toast('Already invited');
-      State.db.invitedUsers.push({email,name,role:val('inv_role')});
-      const r=await call('inviteUser',{email,name,role:val('inv_role')});
-      persist();closeModal();viewTeam();toast(`Invite saved for ${email}`);
-    }}]);
+  openModal('Invite team member',
+    '<div class="fgrid">' +
+      '<div class="field"><label>Name *</label><input id="inv_name" placeholder="e.g. Ahmed Ali"></div>' +
+      '<div class="field"><label>Role</label><select id="inv_role"><option value="manager">Manager</option><option value="admin">Admin (full access)</option></select></div>' +
+      '<div class="field"><label>WhatsApp number</label><input id="inv_phone" type="tel" placeholder="e.g. 7791234 or +960 7791234"></div>' +
+      '<div class="field"><label>Email</label><input id="inv_email" type="email" placeholder="ahmed@example.com"></div>' +
+    '</div>' +
+    '<p class="muted" style="font-size:12.5px;margin-top:4px">Add a WhatsApp number, an email, or both. If you add an email, they must sign up with that exact address.</p>',
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:'Create invitation', cls:'accent', fn:createInvite}]);
 }
-async function removeInvite(email){
-  confirmDel(`Remove access for ${email}?`,async()=>{
-    State.db.invitedUsers=(State.db.invitedUsers||[]).filter(u=>u.email!==email);
-    await call('removeInvite',{email});
-    persist();viewTeam();toast('Access removed');
+
+async function createInvite(){
+  var name = val('inv_name').trim(), email = val('inv_email').trim().toLowerCase(),
+      phone = val('inv_phone').trim(), role = val('inv_role') || 'manager';
+  if (!name) return toast('Enter their name');
+  if (!email && !phone) return toast('Add a WhatsApp number or an email');
+  if (email && !/^\S+@\S+\.\S+$/.test(email)) return toast('That email address looks wrong');
+  if (email && _teamInvites.some(function(i){ return i.email === email; })) return toast('Already invited');
+  var inv = { code:_randCode(24), ownerUid:_bizUid(), ownerName:_inviteBizName(), name:name, email:email, phone:phone,
+              role:role, status:'pending', createdAt:new Date().toISOString() };
+  try { await _fdb.collection('invites').doc(inv.code).set(inv); }
+  catch(e) { return toast('Could not save invitation: ' + e.message); }
+  _teamInvites.unshift(inv);
+  closeModal(); _renderTeam();
+  setTimeout(function(){ showInviteShare(inv); }, 60);
+}
+
+function showInviteShare(inv){
+  openModal('Invitation ready',
+    '<p style="font-size:13.5px;margin-bottom:12px">Send this to <b>' + esc(inv.name) + '</b>. When they open the link and sign in, they are added to your business automatically.</p>' +
+    '<div style="display:grid;gap:8px;margin-bottom:12px">' +
+      '<a class="btn accent" style="padding:13px;text-align:center" target="_blank" rel="noopener" href="' + esc(_waUrl(inv)) + '">Send via WhatsApp</a>' +
+      (inv.email ? '<a class="btn ghost" style="padding:13px;text-align:center" href="' + esc(_mailUrl(inv)) + '">Send via email (opens your mail app)</a>' : '') +
+      '<button class="btn ghost" style="padding:13px" onclick="copyInviteLink(\'' + inv.code + '\')">Copy invitation link</button>' +
+    '</div>' +
+    '<code style="display:block;font-size:11px;word-break:break-all;color:var(--ink-soft)">' + esc(_inviteLink(inv.code)) + '</code>',
+    [{label:'Done', cls:'accent', fn:closeModal}], 'sm');
+}
+
+function copyInviteLink(code){
+  var link = _inviteLink(code);
+  var done = function(){ toast('Invitation link copied'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(link).then(done).catch(function(){ window.prompt('Copy this invitation link:', link); });
+  else window.prompt('Copy this invitation link:', link);
+}
+
+function removeInvite(code){
+  var inv = _teamInvites.find(function(i){ return i.code === code; }); if (!inv) return;
+  confirmDel('Remove ' + inv.name + '?' + (inv.status === 'accepted' ? ' They will lose access immediately.' : ''), async function(){
+    try {
+      if (inv.status === 'accepted' && inv.acceptedBy) await _fdb.collection('members').doc(inv.acceptedBy).delete();
+      await _fdb.collection('invites').doc(code).delete();
+      _teamInvites = _teamInvites.filter(function(i){ return i.code !== code; });
+      _renderTeam(); toast('Removed');
+    } catch(e) { toast('Error: ' + e.message); }
   });
 }
 
+/* ---------- Staff POS link: shortcut in the POS tab + Settings ---------- */
+function posStaffUrl(){
+  var s = (State.db && State.db.settings) || {};
+  return location.href.split(/[?#]/)[0].replace(/[^/]*$/, '') + 'pos.html?t=' + encodeURIComponent(s.posToken || '');
+}
+function openPosLink(){ window.open(posStaffUrl(), '_blank'); }
 function copyPosLink(){
-  var link=document.getElementById('s_poslink').value;
-  if(navigator.clipboard){
-    navigator.clipboard.writeText(link).then(function(){toast('POS link copied! Share it with staff.');}).catch(function(){fallbackCopyPosLink(link);});
+  var link = posStaffUrl();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(link).then(function(){ toast('POS link copied! Share it with staff.'); }).catch(function(){ fallbackCopyPosLink(link); });
   } else { fallbackCopyPosLink(link); }
 }
 function fallbackCopyPosLink(link){
-  var el=document.getElementById('s_poslink');
-  el.style.cssText='position:fixed;top:50%;left:50%;opacity:1;width:80%;font-size:14px;padding:8px';
-  el.select();document.execCommand('copy');
-  el.style.cssText='position:absolute;opacity:0;pointer-events:none;width:1px;height:1px';
-  toast('POS link copied!');
+  var ta = document.createElement('textarea');
+  ta.value = link; ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); toast('POS link copied!'); } catch(e) { window.prompt('Copy this POS link:', link); }
+  document.body.removeChild(ta);
 }
 function sharePosLink(){
-  var link=document.getElementById('s_poslink').value;
-  navigator.share({title:'POS Access Link',text:'Use this link to open the POS register:',url:link}).catch(function(){});
+  var link = posStaffUrl();
+  if (navigator.share) navigator.share({ title:'POS Access Link', text:'Use this link to open the POS register:', url:link }).catch(function(){});
+  else copyPosLink();
 }
 function addUOM(){const v=val('s_newuom').trim();if(!v)return;if(!State.db.settings.uoms)State.db.settings.uoms=[];if(State.db.settings.uoms.includes(v))return toast('Already in list');State.db.settings.uoms.push(v);persist();viewSettings();toast('Unit added');}
 function removeUOM(u){State.db.settings.uoms=(State.db.settings.uoms||[]).filter(x=>x!==u);persist();const tags=document.getElementById('uomTagList');if(tags)tags.innerHTML=State.db.settings.uoms.map(x=>`<span class="uom-tag">${esc(x)}<button onclick="removeUOM('${esc(x)}')">×</button></span>`).join('');}
-function resetPosToken(){confirmDel('Reset the POS link? All staff will need to bookmark the new URL.',()=>{State.db.settings.posToken=uid();persist();viewSettings();toast('POS access link has been reset.');});}
+function resetPosToken(){confirmDel('Reset the POS link? All staff will need to bookmark the new URL.',()=>{const old=State.db.settings.posToken;State.db.settings.posToken=uid();if(old)_fdb.collection('pos_portals').doc(old).delete().catch(()=>{});persist();viewSettings();toast('POS access link has been reset.');});}
 
 
 
@@ -3745,7 +4046,7 @@ function _renderConfirmModal(o) {
        var newTotals={subtotal:+newTotal.toFixed(2),tax:+(newTotal*rate).toFixed(2),total:+(newTotal*(1+rate)).toFixed(2)};
        var entry={status:'confirmed',date:todayISO(),
          time:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),note:note};
-       _fdb.collection('businesses').doc(State.user.uid).collection('customerOrders').doc(_cfOrderId)
+       _fdb.collection('businesses').doc(_bizUid()).collection('customerOrders').doc(_cfOrderId)
          .update({status:'confirmed',lineItems:_cfItems,totals:newTotals,
            timeline:firebase.firestore.FieldValue.arrayUnion(entry)})
          .then(function(){ closeModal(); toast('Confirmed — customer can now pay'); viewCustomerOrders(); })
@@ -3777,7 +4078,7 @@ function _cfUpdateTotal() {
 function viewCustomerOrders() {
   var c=document.getElementById('content');
   c.innerHTML='<div class="card pad muted" style="text-align:center">Loading orders…</div>';
-  _fdb.collection('businesses').doc(State.user.uid)
+  _fdb.collection('businesses').doc(_bizUid())
     .collection('customerOrders').limit(200).get()
     .then(function(snap){
       _customerOrders=snap.docs.map(function(d){ return d.data(); })
@@ -3944,7 +4245,7 @@ function _renderOrders() {
 function openOrderDetail(orderId) {
   var cached=_customerOrders.find(function(o){ return o.id===orderId; });
   if(cached){ _showOrderModal(cached); return; }
-  _fdb.collection('businesses').doc(State.user.uid).collection('customerOrders').doc(orderId).get()
+  _fdb.collection('businesses').doc(_bizUid()).collection('customerOrders').doc(orderId).get()
     .then(function(doc){ if(doc.exists)_showOrderModal(doc.data()); else toast('Order not found'); })
     .catch(function(e){ toast('Error: '+e.message); });
 }
@@ -4012,7 +4313,7 @@ function _showOrderModal(o) {
 function updateOrderStatus(orderId, status, note) {
   var entry={status:status, date:todayISO(),
     time:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}), note:note||''};
-  _fdb.collection('businesses').doc(State.user.uid).collection('customerOrders').doc(orderId)
+  _fdb.collection('businesses').doc(_bizUid()).collection('customerOrders').doc(orderId)
     .update({status:status, timeline:firebase.firestore.FieldValue.arrayUnion(entry)})
     .then(function(){
       toast('Status updated: '+(_orderStatusLabel(status)));
