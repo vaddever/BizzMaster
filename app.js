@@ -1,16 +1,16 @@
-/* QuoteMaster — app.js
+/* Bizz Master — app.js
  * Bundled from js/ module files.
  * To edit a module: edit the file in js/ then run: node build.js
  * Modules: core, mod-dashboard, mod-products, mod-stock, mod-customers, mod-invoices, mod-deliveries, mod-email, mod-settings, mod-zakat, mod-gst, mod-expenses, mod-barcode, mod-employees, mod-pos, mod-team, mod-admin, mod-upgrade, mod-orders
  */
 
 /* ── MODULE: core ── */
-/* QuoteMaster — Application */
+/* Bizz Master — Application */
 
 // pre-declare globals to prevent TDZ errors
 var _adminUsers=[], _adminTab='users';
 /* ============================================================
-   QuoteMaster — front-end app.
+   Bizz Master — front-end app.
    Data layer is Firebase (Auth + Firestore) — see DATA LAYER block below.
    ============================================================ */
 
@@ -99,13 +99,6 @@ function syncPortal(uid) {
     taxLabel: s.taxLabel || 'GST',
     taxRate: s.taxRate || 6,
     bankDetails: s.bankDetails || '',
-    showInDirectory: s.showInDirectory||false,
-    description: s.businessDescription||'',
-    category: s.businessCategory||'Retail',
-    openTime: s.openTime||'08:00',
-    closeTime: s.closeTime||'20:00',
-    branch: s.businessBranch||'',
-    openDays: s.openDays||['mon','tue','wed','thu','fri','sat'],
     updatedAt: new Date().toISOString(),
     items: (State.db.items || [])
       .filter(function(i){ return i.unitPrice > 0; })
@@ -127,7 +120,7 @@ function starterDb(businessName, email) {
       quoteValidity:14, paymentTerms:'Payment due within 14 days.',
       bankDetails:'', quoteFooter:'', invoiceFooter:'', senderName:businessName||'',
       senderEmail:email||'', posToken:'', orderToken:'',
-      showInDirectory:false, businessDescription:'', businessCategory:'Retail', openTime:'08:00', closeTime:'20:00', businessBranch:'', openDays:['mon','tue','wed','thu','fri','sat'], uoms:['pc','kg','g','L','mL','m','box','bag','pair'],
+      uoms:['pc','kg','g','L','mL','m','box','bag','pair'],
       zakatNisabStd:'silver', zakatSilverPrice:32.82, zakatGoldPrice:440 },
     counters:{ quote:1, invoice:1, delivery:1, pos:1 },
     items:[], customers:[], quotations:[], invoices:[], deliveries:[],
@@ -220,30 +213,6 @@ function blankDB(biz){
   };
 }
 
-/* seed demo content */
-function seedDemo(db){
-  db.settings.businessName='Atoll Supplies Co.'; db.settings.phone='+960 330 1234';
-  db.settings.address='Boduthakurufaanu Magu\nMalé 20094, Maldives';
-  db.items=[
-    {id:uid(),name:'A4 Copy Paper (80gsm, ream)',sku:'PPR-A4-80',unitPrice:65,taxable:true,unit:'ream',desc:'500 sheets, premium white'},
-    {id:uid(),name:'Office Chair — Ergonomic',sku:'FRN-CHR-01',unitPrice:1850,taxable:true,unit:'pc',desc:'Mesh back, adjustable'},
-    {id:uid(),name:'Installation & Setup',sku:'SVC-INST',unitPrice:500,taxable:false,unit:'hr',desc:'On-site service'},
-    {id:uid(),name:'HP Laser Toner 26A',sku:'PRN-TNR-26A',unitPrice:980,taxable:true,unit:'pc',desc:'Black, OEM'},
-  ];
-  const c={name:'Reef Hotels Pvt Ltd',email:'procurement@reefhotels.mv',address:'Hithigasmagu\nMalé, Maldives',phone:'+960 333 7777'};
-  const q1=newDoc('quote',db);
-  q1.customer=c; q1.status='sent';
-  q1.lineItems=[{...lineFromItem(db.items[1]),qty:6},{...lineFromItem(db.items[0]),qty:20}];
-  calcDoc(q1,db); db.quotations.push(q1);
-  const inv=newDoc('invoice',db);
-  inv.customer=c; inv.status='unpaid';
-  inv.lineItems=[{...lineFromItem(db.items[1]),qty:6},{...lineFromItem(db.items[2]),qty:3}];
-  calcDoc(inv,db); db.invoices.push(inv);
-  const inv2=newDoc('invoice',db);
-  inv2.customer={name:'Blue Lagoon Cafe',email:'info@bluelagoon.mv',address:'Majeedhee Magu, Malé',phone:''};
-  inv2.status='paid'; inv2.lineItems=[{...lineFromItem(db.items[3]),qty:4}]; calcDoc(inv2,db); db.invoices.push(inv2);
-}
-
 /* ============================================================
    helpers
    ============================================================ */
@@ -286,10 +255,6 @@ function setAuthMode(m){
   document.getElementById('authErr').textContent='';
 }
 document.getElementById('authToggle').onclick=()=>setAuthMode(authMode==='register'?'login':'register');
-document.getElementById('demoLink').onclick=()=>{
-  setAuthMode('register');
-  document.getElementById('r_biz').focus();
-};
 document.getElementById('authBtn').onclick = doAuth;
 async function doAuth() {
   const email = document.getElementById('a_email').value.trim().toLowerCase();
@@ -1479,42 +1444,6 @@ function viewSettings(){
         <div class="field"><label>POS receipt prefix</label><input id="s_pos" value="${esc(s.posPrefix||'TXN-')}"></div>
       </div>
 
-      ${(function(){
-  const cats=['Retail','Restaurant & Food','Grocery','Electronics','Fashion & Clothing','Services','Healthcare','Education','Travel & Tourism','Other'];
-  const catOpts=cats.map(c=>'<option value="'+esc(c)+'"'+(s.businessCategory===c?' selected':'')+'>'+esc(c)+'</option>').join('');
-  return '<div class="card pad" style="grid-column:1/-1;border-left:3px solid var(--accent)">'+
-    '<h3 style="margin-bottom:14px">&#127758; Public Business Directory</h3>'+
-    '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin-bottom:14px">'+
-      '<div><div style="font-weight:600">Show in QuoteMaster directory</div>'+
-      '<div class="muted" style="font-size:12.5px;margin-top:3px">Allow customers to find and order from your business</div></div>'+
-      '<select id="s_dir" style="border:1px solid var(--line);border-radius:9px;padding:8px 12px;flex-shrink:0">'+
-        '<option value="1"'+(s.showInDirectory?' selected':'')+'>Yes — show in directory</option>'+
-        '<option value="0"'+(!s.showInDirectory?' selected':'')+'>No — keep private</option>'+
-      '</select></div>'+
-    '<div class="fgrid">'+
-      '<div class="field"><label>Business category</label>'+
-        '<select id="s_cat" style="width:100%;padding:10px 12px;border:1.5px solid var(--line);border-radius:10px">'+catOpts+'</select></div>'+
-      '<div class="field"><label>Short description (shown in directory)</label>'+
-        '<textarea id="s_desc" rows="2" style="width:100%;padding:10px 12px;border:1.5px solid var(--line);border-radius:10px;resize:vertical">'+esc(s.businessDescription||'')+'</textarea></div>'+
-    '</div>'+
-    '<div class="fgrid" style="margin-top:12px">'+
-      '<div class="field"><label>&#128336; Opening time</label>'+
-        '<input id="s_open" type="time" value="'+(s.openTime||'08:00')+'" style="width:100%;padding:10px 12px;border:1.5px solid var(--line);border-radius:10px"></div>'+
-      '<div class="field"><label>&#128336; Closing time</label>'+
-        '<input id="s_close" type="time" value="'+(s.closeTime||'20:00')+'" style="width:100%;padding:10px 12px;border:1.5px solid var(--line);border-radius:10px"></div>'+
-    '</div>'+
-    '<div class="field" style="margin-top:12px"><label>Branch / location</label>'+
-      '<input id="s_branch" value="'+esc(s.businessBranch||'')+'" placeholder="e.g. Male City, Hulhumale, Addu City" style="width:100%;padding:10px 12px;border:1.5px solid var(--line);border-radius:10px"></div>'+
-    '<div class="field" style="margin-top:12px"><label>Open days</label>'+
-      '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:6px">'+
-        [['mon','Mon'],['tue','Tue'],['wed','Wed'],['thu','Thu'],['fri','Fri'],['sat','Sat'],['sun','Sun']].map(function(d){
-          var checked=(s.openDays||['mon','tue','wed','thu','fri','sat']).includes(d[0]);
-          return '<label style="display:flex;align-items:center;gap:5px;padding:5px 12px;border:1.5px solid var(--line);border-radius:9px;cursor:pointer;font-size:13.5px;font-weight:600;background:'+(checked?'var(--accent-soft)':'var(--paper)')+';border-color:'+(checked?'var(--accent)':'var(--line)')+'">'+
-            '<input type="checkbox" id="s_day_'+d[0]+'" value="'+d[0]+'"'+(checked?' checked':'')+' style="width:auto"> '+d[1]+'</label>';
-        }).join('')+
-      '</div></div>'+
-  '</div>';
-})()}
 <div style="margin-top:16px"><button class="btn accent" onclick="saveSettings()">Save all settings</button></div>
     </div>
    </div>`;
@@ -1530,19 +1459,8 @@ function saveSettings(){
   s.paymentTerms=val('s_terms');s.bankDetails=val('s_bank');s.quoteFooter=val('s_qfoot');s.invoiceFooter=val('s_ifoot');
   s.senderName=val('s_sname')||s.businessName;s.senderEmail=val('s_semail')||s.email;
   if(val('s_pos'))s.posPrefix=val('s_pos');
-  // ── Directory & hours ────────────────────────────────────────────────────
-  s.showInDirectory = val('s_dir')==='1';
-  s.businessCategory = val('s_cat')||s.businessCategory||'Retail';
-  s.businessDescription = (document.getElementById('s_desc')||{}).value||'';
-  s.openTime  = val('s_open')||'08:00';
-  s.closeTime = val('s_close')||'20:00';
-  s.businessBranch = val('s_branch')||'';
-  // Open days: collect checked checkboxes
-  var days=['mon','tue','wed','thu','fri','sat','sun'];
-  s.openDays = days.filter(function(d){ var el=document.getElementById('s_day_'+d); return el&&el.checked; });
-  // ─────────────────────────────────────────────────────────────────────────
   persist();
-  // Force portal sync immediately so directory updates right away
+  // Keep the customer order link data (bank details, products) in sync
   var uid=State.user&&State.user.uid;
   if(uid) syncPortal(uid);
   refreshChrome();toast('Settings saved');
@@ -2545,20 +2463,19 @@ function zkBuildSide(res, r) {
     '</div></div>';
 }
 
-/* Also patch startZakatCalc to seed new fields */
-var _origStartZakat = startZakatCalc;
-startZakatCalc = function() {
-  _origStartZakat();
-  // Seed new fields not in original rec
-  if (!_zkRec.currency)          _zkRec.currency = 'MVR';
-  if (!_zkRec.exchangeRate)      _zkRec.exchangeRate = 15.4;
-  if (!_zkRec.shares)            _zkRec.shares = 0;
-  if (!_zkRec.businessCash)      _zkRec.businessCash = 0;
+/* Seed the MIRA-style fields on every new Zakat calculation */
+var _origZkStartNew = zkStartNew;
+zkStartNew = function() {
+  _origZkStartNew();
+  if (!_zkRec.currency)           _zkRec.currency = 'MVR';
+  if (!_zkRec.exchangeRate)       _zkRec.exchangeRate = 15.4;
+  if (!_zkRec.shares)             _zkRec.shares = 0;
+  if (!_zkRec.businessCash)       _zkRec.businessCash = 0;
   if (!_zkRec.creditCardPayments) _zkRec.creditCardPayments = 0;
-  if (!_zkRec.homePayments)      _zkRec.homePayments = 0;
-  if (!_zkRec.businessPayments)  _zkRec.businessPayments = 0;
-  if (!_zkRec.vehiclePayments)   _zkRec.vehiclePayments = 0;
-  if (!_zkRec.generalDebts)      _zkRec.generalDebts = 0;
+  if (!_zkRec.homePayments)       _zkRec.homePayments = 0;
+  if (!_zkRec.businessPayments)   _zkRec.businessPayments = 0;
+  if (!_zkRec.vehiclePayments)    _zkRec.vehiclePayments = 0;
+  if (!_zkRec.generalDebts)       _zkRec.generalDebts = 0;
   zkRenderCalc();
 };
 
@@ -2815,7 +2732,7 @@ function gstPrintReturn(period) {
       (res.payable>0 ? row('6. GST payable to MIRA',money(res.payable),true) : row('6. Input tax credit (carry forward)',money(res.carryFwd),true))+
     '</tbody></table>' +
     '<div style="margin-top:28px;font-size:12px;color:#999;border-top:1px solid #e4ded2;padding-top:14px">' +
-      'Generated by QuoteMaster &mdash; file via <a href="https://mirac.mira.gov.mv">MIRAconnect</a> &mdash; MIRA hotline: 1415' +
+      'Generated by Bizz Master &mdash; file via <a href="https://mirac.mira.gov.mv">MIRAconnect</a> &mdash; MIRA hotline: 1415' +
     '</div></body></html>');
   win.document.close();
   win.print();
@@ -2884,7 +2801,7 @@ function gstRenderInputTax(panel) {
   var helpHtml =
     '<div class="card pad" style="background:var(--accent-soft);border-color:var(--accent);margin-bottom:12px;font-size:13.5px">' +
       '<b>Claiming Input Tax on Purchases</b><br>' +
-      'To claim GST you paid on business expenses, tick the "GST incl." checkbox on each expense and QuoteMaster will calculate the reclaimable amount. ' +
+      'To claim GST you paid on business expenses, tick the "GST incl." checkbox on each expense and Bizz Master will calculate the reclaimable amount. ' +
       'You must have a valid tax invoice to claim input tax.' +
     '</div>';
   if (!exps.length) { panel.innerHTML = helpHtml + emptyBox('No expenses yet','Add expenses and mark them as GST-inclusive to track input tax.'); return; }
@@ -3417,7 +3334,7 @@ async function viewTeam(){
      <b>How team access works</b>
      <ol style="margin-top:8px;padding-left:18px;font-size:13px;line-height:1.9;color:var(--ink-soft)">
        <li>Add the team member's email above.</li>
-       <li>They go to <strong>wadde.online/quotemaster/</strong> and register with that exact email.</li>
+       <li>They open <strong>${esc(location.origin+location.pathname.replace(/[^/]*$/,''))}</strong> and register with that exact email.</li>
        <li>Their account automatically links to your business data on first login.</li>
        <li>You can manage their access from this page at any time.</li>
      </ol>
@@ -3697,7 +3614,7 @@ function openUpgrade(){
     deliveries:'Delivery notes',email:'Email sending & inbox',team:'Team / multi-user access'};
   const proList=Object.entries(pf).filter(([k,v])=>v).map(([k])=>featureNames[k]||k).filter(Boolean);
   if(!proList.length)proList.push('Delivery management','Email sending & receiving','Team access');
-  openModal('Upgrade to QuoteMaster Pro',`
+  openModal('Upgrade to Bizz Master Pro',`
    <div class="plans">
      <div class="plan"><h4>Free</h4><div class="price">${sym} 0</div><div class="muted">forever</div>
        <ul>${['Product catalogue','Unlimited quotations','Unlimited invoices','Branded PDF layouts','Business profile & logo'].map(f=>`<li>${svg('check')}${f}</li>`).join('')}</ul>
