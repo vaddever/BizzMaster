@@ -578,7 +578,7 @@ function lockedView(view){
 /* ============================================================
    MOBILE HELPERS
    ============================================================ */
-function isMob(){return window.innerWidth<768;}
+function isMob(){return window.innerWidth<900;}   // phone + tablet portrait (sidebar is a drawer below 900px)
 
 function recentCards(recent){
   if(!recent.length)return emptyBox('No documents yet','Create your first quotation or invoice to get started.');
@@ -1060,7 +1060,7 @@ function renderStockAudit(tracked){
     <div class="ah ar">Variance</div>
     <div class="ah ar">Cost impact</div>
     ${tracked.map(i=>`
-      <div class="ac">${esc(i.name)}<div class="muted" style="font-size:11px">${esc(i.unit||'pc')}</div></div>
+      <div class="ac" style="display:block">${esc(i.name)}<div class="muted" style="font-size:11px">${esc(i.unit||'pc')}</div></div>
       <div class="ac ar"><span class="mono">${i.stockQty||0}</span></div>
       <div class="ac ar"><input type="number" step="1" min="0" id="audit_${i.id}" value="${i.stockQty||0}" oninput="calcAuditRow('${i.id}',${i.stockQty||0},${i.costPrice||0})"></div>
       <div class="ac ar" id="avar_${i.id}">—</div>
@@ -1496,47 +1496,87 @@ function printDelivery(id){
    EMAIL (PRO) — demo: queues to Outbox. Production: backend sends.
    ============================================================ */
 var emailTab='outbox';
+/* ============================================================
+   EMAIL & WHATSAPP — documents are sent from your own mail app or WhatsApp.
+   (A website on GitHub Pages has no mail server, so it can't send email by itself.)
+   ============================================================ */
+function _emailChannelLabel(c){ return c === 'whatsapp' ? 'WhatsApp' : c === 'email' ? 'Mail app' : 'Email'; }
 function viewEmail(){
-  document.getElementById('content').innerHTML=`
-    <div class="between" style="margin-bottom:14px"><div class="tabs">
-      <button class="${emailTab==='outbox'?'active':''}" onclick="emailTab='outbox';viewEmail()">Sent / Outbox</button>
-      <button class="${emailTab==='inbox'?'active':''}" onclick="emailTab='inbox';viewEmail()">Inbox</button>
-    </div><button class="btn accent" onclick="composeEmail()">${svg('send')} Compose</button></div>
-    <div id="emailList"></div>`;
-  const host=document.getElementById('emailList');
-  if(emailTab==='inbox'){
-    host.innerHTML=`<div class="card pad" style="border-style:dashed"><div class="row" style="gap:14px"><div class="ic" style="width:40px;height:40px;border-radius:10px;background:var(--accent-soft);color:var(--accent-ink);display:grid;place-items:center">${svg('mail',20)}</div>
-      <div><b>Inbox sync requires email integration.</b><div class="muted" style="font-size:13px;margin-top:3px">Connect a Gmail account (backend) or an inbound-parse service to receive replies here. See the setup guide — this is the one feature that needs an external mail service.</div></div></div></div>`;
-    renderIcons(host);return;
+  var c = document.getElementById('content');
+  var sent = (State.db.emails || []).slice().reverse();
+  var rows = sent.map(function(e){
+    return '<tr><td>' + esc(e.to || e.phone || '—') + '</td><td>' + esc(e.subject || '') + '</td>' +
+      '<td class="mono muted">' + esc(e.attach || '—') + '</td><td>' + fmtDate(e.date) + '</td>' +
+      '<td><span class="pill ' + (e.channel === 'whatsapp' ? 'paid' : 'sent') + '">' + _emailChannelLabel(e.channel) + '</span></td></tr>';
+  }).join('');
+  c.innerHTML =
+    '<div class="between" style="margin-bottom:14px;gap:10px;flex-wrap:wrap">' +
+      '<p class="muted" style="font-size:13px;max-width:560px">Messages open in your own mail app or WhatsApp, ready to send. A record of each one is kept here.</p>' +
+      '<button class="btn accent" onclick="composeEmail()">' + svg('send') + ' New message</button>' +
+    '</div>' +
+    (sent.length
+      ? '<div class="tbl"><table><thead><tr><th>To</th><th>Subject</th><th>Attachment</th><th>Date</th><th>Sent via</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+      : emptyBox('No messages yet', 'Use the send button on a quotation or invoice, or start a new message.'));
+  renderIcons(c);
+}
+function emailDoc(type, id){
+  if (featureLocked('email')) { toast('Sending documents is a Pro feature'); openUpgrade(); return; }
+  var coll = type === 'quote' ? State.db.quotations : State.db.invoices;
+  var d = coll.find(function(x){ return x.id === id; }); if (!d) return;
+  var s = State.db.settings, isQ = type === 'quote';
+  composeEmail({
+    to: (d.customer && d.customer.email) || '', phone: (d.customer && d.customer.phone) || '',
+    subject: (isQ ? 'Quotation' : 'Invoice') + ' ' + d.number + ' from ' + s.businessName,
+    body: 'Dear ' + ((d.customer && d.customer.name) || 'Customer') + ',\n\nPlease find attached ' + (isQ ? 'our quotation' : 'invoice') + ' ' + d.number +
+      ' for ' + money(d.totals.total).replace(/[\u202A\u202C]/g, '') + '.' +
+      (((isQ ? s.quoteFooter : s.invoiceFooter) || '').trim() ? '\n\n' + ((isQ ? s.quoteFooter : s.invoiceFooter) || '').trim() : '') +
+      '\n\nRegards,\n' + (s.senderName || s.businessName) + (s.senderEmail ? '\n' + s.senderEmail : '') + (s.phone ? '\n' + s.phone : ''),
+    attach: d.number + '.pdf', docType: type, docId: id
+  });
+}
+var _composePre = {};
+function composeEmail(pre){
+  if (featureLocked('email')) { openUpgrade(); return; }
+  _composePre = pre || {};
+  var p = _composePre;
+  openModal('Send message',
+    (p.docId
+      ? '<div class="card" style="padding:11px 13px;margin-bottom:12px;background:var(--accent-soft);border-color:var(--accent);font-size:13px">' +
+          '<b>Attaching ' + esc(p.attach) + '</b><br>' +
+          '<span class="muted">1. Tap <b>Save PDF</b> and choose “Save as PDF”.  2. Tap <b>Open in mail app</b> and attach the saved file.</span>' +
+          '<div style="margin-top:8px"><button class="btn ghost sm" onclick="printDoc(\'' + p.docType + '\',\'' + p.docId + '\')">Save PDF</button></div>' +
+        '</div>'
+      : '') +
+    '<div class="fgrid">' +
+      '<div class="field"><label>Email</label><input id="em_to" type="email" value="' + esc(p.to || '') + '" placeholder="customer@email.com"></div>' +
+      '<div class="field"><label>WhatsApp number</label><input id="em_phone" type="tel" value="' + esc(p.phone || '') + '" placeholder="e.g. 7791234"></div>' +
+    '</div>' +
+    '<div class="field"><label>Subject</label><input id="em_subj" value="' + esc(p.subject || '') + '"></div>' +
+    '<div class="field"><label>Message</label><textarea id="em_body" rows="8">' + esc(p.body || '') + '</textarea></div>' +
+    '<p class="muted" style="font-size:12px">Bizz Master opens your mail app or WhatsApp with this message ready — you press Send there.</p>',
+    [{label:'Cancel', cls:'ghost', fn:closeModal},
+     {label:'Send via WhatsApp', cls:'ghost', fn:function(){ _sendMessage('whatsapp'); }},
+     {label:'Open in mail app', cls:'accent', fn:function(){ _sendMessage('email'); }}]);
+}
+function _openExternal(url, newTab){
+  var a = document.createElement('a'); a.href = url; if (newTab) { a.target = '_blank'; a.rel = 'noopener'; }
+  document.body.appendChild(a); a.click(); a.remove();
+}
+function _sendMessage(channel){
+  var to = val('em_to').trim(), phone = val('em_phone').trim(), subject = val('em_subj'), body = val('em_body');
+  if (channel === 'email' && !to) return toast('Enter an email address');
+  if (channel === 'email') {
+    _openExternal('mailto:' + to + '?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body), false);
+  } else {
+    var n = _waNumber(phone);
+    _openExternal('https://wa.me/' + n + '?text=' + encodeURIComponent((subject ? '*' + subject + '*\n\n' : '') + body), true);
   }
-  const sent=State.db.emails.slice().reverse();
-  host.innerHTML=sent.length?`<div class="tbl"><table><thead><tr><th>To</th><th>Subject</th><th>Attachment</th><th>Date</th><th>Status</th></tr></thead><tbody>
-    ${sent.map(e=>`<tr><td>${esc(e.to)}</td><td>${esc(e.subject)}</td><td class="mono muted">${esc(e.attach||'—')}</td><td>${fmtDate(e.date)}</td><td><span class="pill sent">queued</span></td></tr>`).join('')}
-  </tbody></table></div>`:emptyBox('No emails yet','Send a quotation or invoice by email, or compose a new message.');
-  renderIcons(host);
-}
-function emailDoc(type,id){
-  if(featureLocked('email')){toast('Emailing documents is a Pro feature');openUpgrade();return;}
-  const coll=type==='quote'?State.db.quotations:State.db.invoices;const d=coll.find(x=>x.id===id);
-  composeEmail({to:d.customer.email||'',subject:`${type==='quote'?'Quotation':'Invoice'} ${d.number} from ${State.db.settings.businessName}`,
-    body:`Dear ${d.customer.name||'Customer'},\n\nPlease find attached ${type==='quote'?'our quotation':'invoice'} ${d.number} for ${money(d.totals.total)}.\n\n${type==='quote'?State.db.settings.quoteFooter:State.db.settings.invoiceFooter}\n\nRegards,\n${State.db.settings.businessName}`,
-    attach:d.number+'.pdf', docHtml:buildDocHtml(type,d)});
-}
-function composeEmail(pre={}){
-  if(featureLocked('email')){openUpgrade();return;}
-  openModal('Compose email',`
-    <div class="field"><label>To</label><input id="em_to" value="${esc(pre.to||'')}" placeholder="customer@email.com"></div>
-    <div class="field"><label>Subject</label><input id="em_subj" value="${esc(pre.subject||'')}"></div>
-    <div class="field"><label>Message</label><textarea id="em_body" rows="8">${esc(pre.body||'')}</textarea></div>
-    ${pre.attach?`<div class="muted" style="font-size:13px">📎 Attachment: <span class="mono">${esc(pre.attach)}</span> (PDF generated on send)</div>`:''}`,
-    [{label:'Cancel',cls:'ghost',fn:closeModal},{label:'Send',cls:'accent',fn:async ()=>{
-      const to=val('em_to');if(!to)return toast('Recipient required');
-      toast('Sending…');
-      const r=await call('sendEmail',{to,subject:val('em_subj'),body:val('em_body'),docHtml:pre.docHtml||'',fileName:(pre.attach||'document').replace(/\.pdf$/,'')});
-      if(!r.ok)return toast(r.error||'Send failed');
-      State.db.emails.push({id:uid(),to,subject:val('em_subj'),body:val('em_body'),attach:pre.attach||'',date:todayISO()});
-      persist();closeModal();toast('Email sent');if(State.view==='email')viewEmail();
-    }}]);
+  if (!State.db.emails) State.db.emails = [];
+  State.db.emails.push({ id:uid(), channel:channel, to:channel === 'email' ? to : '', phone:channel === 'whatsapp' ? phone : '',
+    subject:subject, body:body, attach:_composePre.attach || '', date:todayISO() });
+  persist(); closeModal();
+  toast(channel === 'email' ? 'Opened in your mail app — press Send there' : 'Opened in WhatsApp — press Send there');
+  if (State.view === 'email') viewEmail();
 }
 
 
@@ -1623,11 +1663,11 @@ function viewSettings(){
       </div>
     </div>
     <div class="card pad" style="grid-column:1/-1">
-      <h3 style="margin-bottom:4px">Email sending</h3>
-      <p class="muted" style="font-size:12.5px;margin-bottom:14px">Emails send from your Google account. Set a display name and reply-to address so customers reply to the right place.</p>
+      <h3 style="margin-bottom:4px">Email &amp; WhatsApp messages</h3>
+      <p class="muted" style="font-size:12.5px;margin-bottom:14px">Quotations and invoices are sent from your own mail app or WhatsApp. This name and email are added to the signature of each message.</p>
       <div class="fgrid">
         <div class="field"><label>Sender display name</label><input id="s_sname" value="${esc(s.senderName||s.businessName)}" placeholder="${esc(s.businessName)}"></div>
-        <div class="field"><label>Reply-to email</label><input id="s_semail" value="${esc(s.senderEmail||s.email)}" placeholder="${esc(s.email)}"></div>
+        <div class="field"><label>Email shown in signature</label><input id="s_semail" value="${esc(s.senderEmail||s.email)}" placeholder="${esc(s.email)}"></div>
         <div class="field"><label>POS receipt prefix</label><input id="s_pos" value="${esc(s.posPrefix||'TXN-')}"></div>
       </div>
 
@@ -2851,7 +2891,7 @@ function gstRenderOverview(panel) {
         '<button class="btn accent sm" onclick="gstFileReturn(\''+period+'\')">Record as filed</button>' +
       '</div>' +
     '</div>' +
-    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">' +
+    '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:14px;margin-bottom:14px">' +
       // Output tax card
       '<div class="card pad">' +
         '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft);margin-bottom:10px">&#9650; Output Tax (Sales)</div>' +
@@ -3053,9 +3093,9 @@ function gstRenderSettings(panel) {
     '</div>' +
     '<div class="card pad" style="margin-top:14px;font-size:13px;color:var(--ink-soft)">' +
       '<b style="color:var(--ink)">MIRA key rules</b><br>' +
-      '&#x2022; <cite index="4-1">GST rate: <b>8%</b> (General sector from 1 Jan 2023) · <b>17%</b> (Tourism from 1 Jul 2025)</cite><br>' +
-      '&#x2022; <cite index="6-1">File and pay by <b>28th of the month</b> after the taxable period ends</cite><br>' +
-      '&#x2022; <cite index="10-1">Monthly if avg sales &gt; MVR 1 million/month. Quarterly otherwise (Jan–Mar, Apr–Jun, Jul–Sep, Oct–Dec)</cite><br>' +
+      '&#x2022; GST rate: <b>8%</b> (General sector from 1 Jan 2023) · <b>17%</b> (Tourism from 1 Jul 2025)<br>' +
+      '&#x2022; File and pay by <b>28th of the month</b> after the taxable period ends<br>' +
+      '&#x2022; Monthly if avg sales &gt; MVR 1 million/month. Quarterly otherwise (Jan–Mar, Apr–Jun, Jul–Sep, Oct–Dec)<br>' +
       '&#x2022; File online at <a href="https://mirac.mira.gov.mv" target="_blank" class="linkish">MIRAconnect</a> using form MIRA 205 &nbsp;&middot;&nbsp; Hotline: <b>1415</b>' +
     '</div>';
 }
@@ -3351,7 +3391,7 @@ function renderPOS(){
   const s=State.db.settings;
   const items=(State.db.items||[]).filter(i=>i&&i.name&&i.name.toLowerCase().includes((_posSearch||'').toLowerCase()));
   const t=calcPosCart();
-  const mob=isMob();
+  const mob=(window.innerWidth<768);
   document.getElementById('content').innerHTML=`
     <div class="pos-cashier-bar">
       <span>${svg('badge',15)} Cashier: <strong>${esc(posCashier.name)}</strong></span>
@@ -3364,7 +3404,7 @@ function renderPOS(){
     ${mob?`<div class="pos-tab-bar"><button class="pos-tab ${_posTab==='items'?'active':''}" onclick="_posTab='items';renderPOS()">Items</button><button class="pos-tab ${_posTab==='cart'?'active':''}" onclick="_posTab='cart';renderPOS()">Cart (${posCart.reduce((s,c)=>s+c.qty,0)})</button></div>`:''}
     <div class="pos-wrap">
       <div class="pos-items-panel" style="${mob&&_posTab==='cart'?'display:none':''}">
-        <div class="search" style="margin-bottom:10px">${svg('search')}<input placeholder="Search products…" value="${esc(_posSearch||'')}" oninput="_posSearch=this.value;renderPOS()"><button class="iconbtn" style="position:absolute;right:4px;top:50%;transform:translateY(-50%)" title="Scan barcode" onclick="openBarcodeScanner(v=>{const it=State.db.items.find(i=>i.barcode===v||i.sku===v);if(it){addToCart(it.id);if(isMob()){_posTab='cart';renderPOS();}}else{_posSearch=v;renderPOS();toast('No product found for: '+v);}})">${svg('scan',15)}</button></div>
+        <div class="search" style="margin-bottom:10px">${svg('search')}<input placeholder="Search products…" value="${esc(_posSearch||'')}" oninput="_posSearch=this.value;renderPOS()"><button class="iconbtn" style="position:absolute;right:4px;top:50%;transform:translateY(-50%)" title="Scan barcode" onclick="openBarcodeScanner(v=>{const it=State.db.items.find(i=>i.barcode===v||i.sku===v);if(it){addToCart(it.id);if((window.innerWidth<768)){_posTab='cart';renderPOS();}}else{_posSearch=v;renderPOS();toast('No product found for: '+v);}})">${svg('scan',15)}</button></div>
         ${items.length?`<div class="pos-grid">${items.map(i=>{const inCart=posCart.find(c=>c.itemId===i.id);return`<div class="pos-tile ${i.trackStock!==false&&(i.stockQty||0)<=0?'stk-dim':''}" onclick="addToCart('${i.id}')">
           ${inCart?`<div class="pt-badge">${inCart.qty}</div>`:''}
           ${i.trackStock!==false?`<div class="stk-tile ${(i.stockQty||0)<=0?'stk-out':(i.reorderLevel>0&&(i.stockQty||0)<=i.reorderLevel?'stk-low':'stk-good')}">${(i.stockQty||0)<=0?'Out':(i.stockQty||0)}</div>`:''}
@@ -3748,7 +3788,7 @@ function renderAdmin(q){
        <td><select class="pill ${u.plan==='pro'?'paid':'draft'}" style="border:none;font-weight:600;cursor:pointer" onchange="adminSetPlan('${u.userId}',this.value)">
          <option value="free" ${u.plan!=='pro'?'selected':''}>free</option><option value="pro" ${u.plan==='pro'?'selected':''}>pro</option></select></td>
        <td><input type="date" value="${u.expiry||''}" style="border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-size:12px;background:var(--paper)" onchange="adminSetExpiry('${u.userId}',this.value)"></td>
-       <td class="right mono">${u.items}</td><td class="right mono">${u.invoices}</td>
+       <td class="right mono">${u.items??'—'}</td><td class="right mono">${u.invoices??'—'}</td>
        <td class="right mono">${num(u.outstanding)}</td>
        <td><div class="rowacts"><button class="iconbtn" onclick="adminDelete('${u.userId}')">${svg('trash')}</button></div></td>
      </tr>`).join('')}
@@ -3861,7 +3901,7 @@ const FEATURE_TOGGLE_DEFS=[
   {key:'orders',      label:'Customer order portal'},
   {key:'zakat',       label:'Zakat calculator'},
   {key:'deliveries',  label:'Delivery notes'},
-  {key:'email',       label:'Email sending & inbox'},
+  {key:'email',       label:'Send documents by email & WhatsApp'},
   {key:'team',        label:'Team / multi-user portal access'}
 ];
 function renderFeatureToggles(){
@@ -3912,9 +3952,9 @@ function openUpgrade(){
   const pf=proFeatures();
   const featureNames={stock:'Stock management & reorder alerts',multiEmployee:'Unlimited employees',
     expenses:'Expense tracking & P&L',zakat:'Zakat al-māl calculator',
-    deliveries:'Delivery notes',email:'Email sending & inbox',team:'Team / multi-user access'};
+    deliveries:'Delivery notes',email:'Send documents by email & WhatsApp',team:'Team / multi-user access'};
   const proList=Object.entries(pf).filter(([k,v])=>v).map(([k])=>featureNames[k]||k).filter(Boolean);
-  if(!proList.length)proList.push('Delivery management','Email sending & receiving','Team access');
+  if(!proList.length)proList.push('Delivery management','Send documents by email & WhatsApp','Team access');
   openModal('Upgrade to Bizz Master Pro',`
    <div class="plans">
      <div class="plan"><h4>Free</h4><div class="price">${sym} 0</div><div class="muted">forever</div>
@@ -4001,14 +4041,13 @@ function confirmOrder(orderId) {
 function _renderConfirmModal(o) {
   var iRows = _cfItems.map(function(li, ix) {
     return '<tr>' +
-      '<td>'+esc(li.name)+'</td>' +
+      '<td>'+esc(li.name)+'<div class="muted" style="font-size:11.5px;margin-top:2px">'+money(li.unitPrice)+' each</div></td>' +
       '<td style="text-align:center;width:90px">' +
         '<div style="display:flex;align-items:center;gap:4px;justify-content:center">' +
           '<button onclick="_cfQty('+ix+',-1)" style="width:24px;height:24px;border-radius:6px;border:1px solid var(--line);background:var(--paper);cursor:pointer;font-size:14px;font-weight:700">&#8722;</button>' +
           '<span id="cfq_'+ix+'" style="font-weight:700;min-width:24px;text-align:center">'+li.qty+'</span>' +
           '<button onclick="_cfQty('+ix+',1)" style="width:24px;height:24px;border-radius:6px;border:1px solid var(--line);background:var(--paper);cursor:pointer;font-size:14px;font-weight:700">&#43;</button>' +
         '</div></td>' +
-      '<td style="text-align:right;font-family:monospace">'+money(li.unitPrice)+'</td>' +
       '<td style="text-align:right;font-family:monospace;font-weight:600" id="cfa_'+ix+'">'+money(li.amount)+'</td>' +
       '<td><button onclick="_cfRemove('+ix+')" style="background:transparent;color:var(--danger);border:none;cursor:pointer;font-size:16px;padding:2px 6px">&#10005;</button></td>' +
     '</tr>';
@@ -4029,10 +4068,10 @@ function _renderConfirmModal(o) {
         '<div style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;min-height:48px;font-size:13.5px">'+esc(o.notes||'—')+'</div></div>' +
     '</div>' +
     '<div class="tbl" style="margin:12px 0"><table>' +
-      '<thead><tr><th>Item</th><th style="text-align:center">Qty</th><th class="right">Unit</th><th class="right">Amount</th><th></th></tr></thead>' +
+      '<thead><tr><th>Item</th><th style="text-align:center">Qty</th><th class="right">Amount</th><th></th></tr></thead>' +
       '<tbody id="cf_tbody">'+iRows+'</tbody>' +
       '<tfoot><tr>' +
-        '<td colspan="3" style="text-align:right;font-weight:700;padding:8px 0">Total</td>' +
+        '<td colspan="2" style="text-align:right;font-weight:700;padding:8px 10px 8px 0">Total</td>' +
         '<td style="text-align:right;font-weight:700;padding:8px 0;font-family:monospace" id="cf_total">'+money(total)+'</td><td></td>' +
       '</tr></tfoot></table></div>' +
     '<div class="field"><label>Message to customer (optional)</label>' +
@@ -4333,3 +4372,26 @@ function viewOrderSlip(orderId) {
   if(w){ w.document.write('<body style="margin:0;background:#000"><img src="'+slip+'" style="max-width:100%;display:block">'); w.document.close(); }
 }
 
+/* ---------- Phone layout: label table cells so tables can show as stacked cards (see style.css) ---------- */
+function labelTables(root){
+  (root || document).querySelectorAll('.tbl table').forEach(function(t){
+    var heads = [].map.call(t.querySelectorAll('thead th'), function(th){ return th.textContent.trim(); });
+    if (!heads.length) return;
+    t.querySelectorAll('tbody tr').forEach(function(tr){
+      var col = 0;
+      [].forEach.call(tr.children, function(td){
+        if (!td.hasAttribute('data-label')) td.setAttribute('data-label', heads[col] || '');
+        col += (+td.getAttribute('colspan') || 1);
+      });
+    });
+  });
+}
+(function(){
+  var c = document.getElementById('content');
+  if (!c || !window.MutationObserver) return;
+  var queued = false;
+  new MutationObserver(function(){
+    if (queued) return; queued = true;
+    (window.requestAnimationFrame || setTimeout)(function(){ queued = false; labelTables(c); });
+  }).observe(c, { childList:true, subtree:true });
+})();
