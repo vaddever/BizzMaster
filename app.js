@@ -522,6 +522,7 @@ function _accountIsPro(){ return State.isAdmin || ['pro','trial'].indexOf(comput
    Set in Portal Admin → Platform Settings. Stored in platform_config/settings.modules.
    ============================================================ */
 const MODULE_DEFS = [
+  { key:'reports',    view:'reports',    label:'Reports',                          def:'free' },
   { key:'items',      view:'items',      label:'Products',                         def:'free' },
   { key:'stock',      view:'stock',      label:'Stock management',                 def:'free' },
   { key:'customers',  view:'customers',  label:'Customers',                        def:'free' },
@@ -745,6 +746,7 @@ function refreshChrome(){
     lk.textContent=showOff?'OFF':'PRO';
     lk.style.display=(showOff||featureLocked(key))?'inline-block':'none';
   });
+  if(!document.querySelector('#nav a[data-view="reports"]')){ const dn=document.querySelector('#nav a[data-view="dashboard"]'); if(dn){ dn.insertAdjacentHTML('afterend','<a data-view="reports"><span class="ic" data-i="trending"></span> Reports</a>'); renderIcons(document.getElementById('nav')); } }
   if(!document.querySelector('#nav a[data-view="shops"]')){ const st=document.querySelector('#nav a[data-view="stock"]'); if(st){ st.insertAdjacentHTML('afterend','<a data-view="shops"><span class="ic" data-i="shop"></span> Shops</a>'); renderIcons(document.getElementById('nav')); } }
   const _al=document.getElementById('adminLink'); if(_al){ let b=_al.querySelector('.pay-badge'); const n=(State.user&&State.user.pendingPay)||0; if(n){ if(!b){ b=document.createElement('span'); b.className='lock pay-badge'; _al.appendChild(b);} b.textContent=n; b.style.display='inline-block'; } else if(b) b.style.display='none'; }
   _renderShopChip();
@@ -759,7 +761,7 @@ document.getElementById('upgradeBtn').onclick=openUpgrade;
 /* ============================================================
    ROUTER
    ============================================================ */
-const TITLES={shops:'Shops',dashboard:'Dashboard',items:'Products',stock:'Stock',customers:'Customers',pos:'Point of Sale',employees:'Employees',expenses:'Expenses',gst:'GST',zakat:'Zakat Calculator',quotations:'Quotations',invoices:'Invoices',deliveries:'Deliveries',orders:'Customer Orders',email:'Email',team:'Team Access',settings:'Settings',admin:'Portal Admin'};
+const TITLES={reports:'Reports',shops:'Shops',dashboard:'Dashboard',items:'Products',stock:'Stock',customers:'Customers',pos:'Point of Sale',employees:'Employees',expenses:'Expenses',gst:'GST',zakat:'Zakat Calculator',quotations:'Quotations',invoices:'Invoices',deliveries:'Deliveries',orders:'Customer Orders',email:'Email',team:'Team Access',settings:'Settings',admin:'Portal Admin'};
 function go(view){
   if(view==='admin'&&!State.isAdmin){view='dashboard';}
   if(VIEW_FEATURE_MAP[view]&&moduleOff(VIEW_FEATURE_MAP[view])){toast((TITLES[view]||view)+' is not available');view='dashboard';}
@@ -774,7 +776,7 @@ function go(view){
     const views={dashboard:viewDashboard,items:viewItems,stock:viewStock,customers:viewCustomers,
       pos:viewPOS,employees:viewEmployees,expenses:viewExpenses,gst:viewGST,zakat:viewZakat,
       quotations:()=>viewDocs('quote'),invoices:()=>viewDocs('invoice'),deliveries:viewDeliveries,
-      orders:viewCustomerOrders,shops:viewShops,email:viewEmail,team:viewTeam,settings:viewSettings,admin:viewAdmin};
+      orders:viewCustomerOrders,shops:viewShops,reports:viewReports,email:viewEmail,team:viewTeam,settings:viewSettings,admin:viewAdmin};
     if(!views[view]){c.innerHTML='<div class="card pad">Unknown view: '+esc(view)+'</div>';return;}
     views[view]();
     renderIcons(c);
@@ -909,11 +911,13 @@ function viewDashboard(){
   const outstanding=unpaid.reduce((s,i)=>s+(i.totals.total||0),0);
   const paid=db.invoices.filter(i=>i.status==='paid').reduce((s,i)=>s+(i.totals.total||0),0);
   const openQuotes=db.quotations.filter(q=>q.status==='sent'||q.status==='draft').length;
-  const recent=[...db.invoices.map(d=>({...d,_t:'Invoice'})),...db.quotations.map(d=>({...d,_t:'Quotation'}))]
+  const recent=[...db.invoices.map(d=>({...d,_t:'Invoice'})),...db.quotations.map(d=>({...d,_t:'Quotation'})),
+     ...(db.transactions||[]).filter(_inShop).map(t=>({id:t.id,number:t.number,date:t.date,status:'paid',totals:t.totals,customer:{name:t.customer||'Walk-in'},_t:'POS sale'}))]
      .sort((a,b)=>(b.date>a.date?1:-1)).slice(0,6);
   const now=new Date(),mm=now.getMonth(),yy=now.getFullYear();
   const monthStr=now.toLocaleString('default',{month:'long',year:'numeric'});
-  const mthRevenue=(db.invoices||[]).filter(i=>i.status==='paid'&&i.date&&new Date(i.date).getMonth()===mm&&new Date(i.date).getFullYear()===yy).reduce((s,i)=>s+(i.totals.total||0),0);
+  const _today=salesSummary(_localISO(),_localISO()), _mr=_periodRange('month'), _mth=salesSummary(_mr[0],_mr[1]);
+  const mthRevenue=_mth.total;
   const mthExpenses=(db.expenses||[]).filter(e=>e.date&&new Date(e.date).getMonth()===mm&&new Date(e.date).getFullYear()===yy).reduce((s,e)=>s+(e.amount||0),0);
   const netProfit=mthRevenue-mthExpenses;
   const netCls=netProfit>=0?'pl-net-pos':'pl-net-neg';
@@ -932,10 +936,10 @@ function viewDashboard(){
   const lowStock=(db.items||[]).filter(i=>i.trackStock!==false&&i.reorderLevel>0&&(shopQty(i)||0)<=(i.reorderLevel||0)).length;
   document.getElementById('content').innerHTML=trialBanner+`
    <div class="grid kpis" style="margin-bottom:10px">
-     <div class="card kpi"><div class="lbl">Outstanding</div><div class="val">${money(outstanding)}</div><div class="sub muted">${unpaid.length} unpaid</div></div>
-     <div class="card kpi"><div class="lbl">Collected</div><div class="val">${money(paid)}</div><div class="sub up">Paid to date</div></div>
-     <div class="card kpi"><div class="lbl">Open quotes</div><div class="val">${openQuotes}</div><div class="sub muted">awaiting</div></div>
-     <div class="card kpi"><div class="lbl">Avg margin</div><div class="val">${avgMargin!==null?avgMargin.toFixed(1)+'%':'—'}</div><div class="sub muted">${priced.length} priced</div></div>
+     <div class="card kpi" style="cursor:pointer" onclick="_rptPeriod='today';go('reports')"><div class="lbl">Sales today</div><div class="val">${money(_today.total)}</div><div class="sub muted">${_today.posCount} POS · ${_today.invCount} invoice${_today.invCount===1?'':'s'}</div></div>
+     <div class="card kpi" style="cursor:pointer" onclick="_rptPeriod='month';go('reports')"><div class="lbl">Sales this month</div><div class="val">${money(_mth.total)}</div><div class="sub up">${_mth.count} sales · see Reports →</div></div>
+     <div class="card kpi"><div class="lbl">Outstanding</div><div class="val">${money(outstanding)}</div><div class="sub muted">${unpaid.length} unpaid invoice${unpaid.length===1?'':'s'}</div></div>
+     <div class="card kpi"><div class="lbl">Open quotes</div><div class="val">${openQuotes}</div><div class="sub muted">avg margin ${avgMargin!==null?avgMargin.toFixed(1)+'%':'—'}</div></div>
    </div>
    <div class="card" style="padding:12px 18px;margin-bottom:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;border-left:3px solid var(--accent)">
      <div class="inv-stat"><div class="lbl">Inventory cost value</div><div class="val">${money(invCost)}</div></div>
@@ -950,7 +954,9 @@ function viewDashboard(){
          <h3 style="font-size:14px">P&amp;L — ${monthStr}</h3>
          ${isPro()?`<button class="btn ghost tiny" onclick="go('expenses')">Expenses →</button>`:''}
        </div>
-       <div class="pl-row"><span class="lbl">Revenue (paid)</span><span class="amt">${money(mthRevenue)}</span></div>
+       <div class="pl-row"><span class="lbl">POS sales (${_mth.posCount})</span><span class="amt">${money(_mth.posTotal)}</span></div>
+       <div class="pl-row"><span class="lbl">Invoices paid (${_mth.invCount})</span><span class="amt">${money(_mth.invTotal)}</span></div>
+       <div class="pl-row"><span class="lbl" style="font-weight:600">Total sales</span><span class="amt" style="font-weight:600">${money(mthRevenue)}</span></div>
        ${isPro()?`<div class="pl-row"><span class="lbl">Expenses</span><span class="amt" style="color:var(--danger)">${money(mthExpenses)}</span></div>
        <div class="pl-row ${netCls}" style="border-radius:0 0 var(--radius) var(--radius)"><span class="lbl" style="font-weight:700">Net profit</span><span class="amt">${money(Math.abs(netProfit))} ${netProfit<0?'loss':''}</span></div>`
        :`<div class="pl-row" style="border-radius:0 0 var(--radius) var(--radius)"><span class="muted" style="font-size:13px">💡 Track expenses on Pro to see net profit</span><button class="btn amber tiny" onclick="openUpgrade()">Upgrade</button></div>`}
@@ -1027,8 +1033,9 @@ function viewItems(){
   document.getElementById('content').innerHTML=`
    <div class="toolbar">
      <div class="search">${svg('search')}<input placeholder="Search products…" value="${esc(itemSearch)}" oninput="itemSearch=this.value;viewItems()"></div>
-     <div class="row" style="gap:8px;flex-shrink:0">
+     <div class="row items-actions" style="gap:8px;flex-shrink:0">
        <button class="btn ghost sm" onclick="go('stock')">${svg('layers',14)} Stock</button>
+       <button class="btn ghost sm" onclick="openBulkUpload()">${svg('arrowup',14)} Bulk upload</button>
        <button class="btn accent" onclick="openItemEditor()">${svg('plus')} New product</button>
      </div>
    </div>
@@ -1471,7 +1478,7 @@ function statusSelect(type,d){
   return `<select class="pill ${d.status}" style="border:none;font-weight:600;cursor:pointer" onchange="setStatus('${type}','${d.id}',this.value);this.className='pill '+this.value">
     ${opts.map(o=>`<option value="${o}" ${d.status===o?'selected':''}>${o}</option>`).join('')}</select>`;
 }
-function setStatus(type,id,st){const coll=type==='quote'?State.db.quotations:State.db.invoices;const d=coll.find(x=>x.id===id);d.status=st;persist();}
+function setStatus(type,id,st){const coll=type==='quote'?State.db.quotations:State.db.invoices;const d=coll.find(x=>x.id===id);if(type!=='quote'&&st==='paid'&&d.status!=='paid')d.paidDate=_localISO();d.status=st;persist();}
 
 var editing=null; // {type, doc}
 function openDocEditor(type,id){
@@ -3018,6 +3025,12 @@ function calcGstReturn(startIso, endIso) {
     totalSales += (inv.totals && inv.totals.subtotal) || 0;
     outputTax  += (inv.totals && inv.totals.tax)      || 0;
   });
+  // POS sales (all shops — GST is filed for the whole business)
+  var posInRange = _posInRange(startIso, endIso, true);
+  posInRange.forEach(function(t) {
+    totalSales += +(t.totals.subtotal !== undefined ? t.totals.subtotal : (t.totals.sub || 0));
+    outputTax  += +(t.totals.tax || 0);
+  });
 
   // Input tax: from expenses in range that were GST-inclusive
   var expInRange = (db.expenses||[]).filter(function(e) {
@@ -3048,6 +3061,7 @@ function calcGstReturn(startIso, endIso) {
     payable:        payable,
     carryFwd:       carryFwd,
     invoiceCount:   invInRange.length,
+    posCount:       posInRange.length,
     expenseCount:   expInRange.length
   };
 }
@@ -3130,7 +3144,7 @@ function gstRenderOverview(panel) {
         '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft);margin-bottom:10px">&#9650; Output Tax (Sales)</div>' +
         '<div style="display:flex;justify-content:space-between;padding:5px 0;font-size:13.5px;border-bottom:1px solid var(--line)"><span>Taxable sales</span><span class="mono">' + money(res.totalSales) + '</span></div>' +
         '<div style="display:flex;justify-content:space-between;padding:5px 0;font-size:13.5px;border-bottom:1px solid var(--line)"><span>GST charged (' + gstRate() + '%)</span><span class="mono" style="font-weight:700;color:#1d4ed8">' + money(res.outputTax) + '</span></div>' +
-        '<div style="font-size:12px;color:var(--ink-soft);margin-top:8px">' + res.invoiceCount + ' invoice(s) in period</div>' +
+        '<div style="font-size:12px;color:var(--ink-soft);margin-top:8px">' + res.invoiceCount + ' invoice(s) + ' + res.posCount + ' POS sale(s) in period</div>' +
       '</div>' +
       // Input tax card
       '<div class="card pad">' +
@@ -5542,4 +5556,310 @@ async function rejectProRequest(id){
   try { await _fdb.collection('pro_requests').doc(id).update({ status:'rejected', reason:reason, reviewedAt:new Date().toISOString(), reviewedBy:State.user.email }); }
   catch(e) { return toast('Could not reject: ' + e.message); }
   closeModal(); toast('Payment rejected'); renderAdminPayments(); refreshChrome();
+}
+
+/* ============================================================
+   SALES — one source of truth for Dashboard, GST and Reports
+   POS sales (State.db.transactions) + invoices.
+   Invoices count as revenue when paid (on paidDate, or invoice date for older ones).
+   ============================================================ */
+function _posInRange(from, to, allShops){
+  return (State.db.transactions || []).filter(function(t){
+    return t && t.date >= from && t.date <= to && t.totals && (allShops || _inShop(t));
+  });
+}
+function _paidInvoicesInRange(from, to){
+  return (State.db.invoices || []).filter(function(i){
+    const d = i.paidDate || i.date;
+    return i.status === 'paid' && d >= from && d <= to && i.totals;
+  });
+}
+function _costOf(li){ const it = (State.db.items || []).find(function(x){ return x.id === li.itemId; }); return it && it.costPrice ? (+it.costPrice) * (+li.qty || 0) : 0; }
+function salesSummary(from, to, allShops){
+  const pos = _posInRange(from, to, allShops), inv = _paidInvoicesInRange(from, to);
+  const sum = function(arr, k){ return _r2(arr.reduce(function(a, x){ return a + ((x.totals && +x.totals[k]) || 0); }, 0)); };
+  const posTotal = sum(pos, 'total'), posTax = sum(pos, 'tax'), invTotal = sum(inv, 'total'), invTax = sum(inv, 'tax');
+  const cogs = _r2(pos.concat(inv).reduce(function(a, d){ return a + (d.lineItems || []).reduce(function(b, li){ return b + _costOf(li); }, 0); }, 0));
+  const total = _r2(posTotal + invTotal), tax = _r2(posTax + invTax), net = _r2(total - tax);
+  return { pos:pos, inv:inv, posCount:pos.length, invCount:inv.length, posTotal:posTotal, posTax:posTax, invTotal:invTotal, invTax:invTax,
+    total:total, tax:tax, net:net, cogs:cogs, grossProfit:_r2(net - cogs), count:pos.length + inv.length,
+    avg: (pos.length + inv.length) ? _r2(total / (pos.length + inv.length)) : 0 };
+}
+function _expensesInRange(from, to){
+  return _r2((State.db.expenses || []).filter(function(e){ return e.date >= from && e.date <= to; }).reduce(function(a, e){ return a + (+e.amount || 0); }, 0));
+}
+function _isoAdd(iso, days){ const d = new Date(iso + 'T12:00:00'); d.setDate(d.getDate() + days); return _localISO(d); }
+function _periodRange(key){
+  const t = _localISO(), d = new Date(t + 'T12:00:00'), y = d.getFullYear(), m = d.getMonth();
+  const iso = function(dt){ return _localISO(dt); };
+  switch (key) {
+    case 'today':     return [t, t];
+    case 'yesterday': return [_isoAdd(t, -1), _isoAdd(t, -1)];
+    case 'week':      { const dow = (d.getDay() + 6) % 7; return [_isoAdd(t, -dow), t]; }   // Monday → today
+    case 'month':     return [iso(new Date(y, m, 1)), t];
+    case 'lastmonth': return [iso(new Date(y, m - 1, 1)), iso(new Date(y, m, 0))];
+    case 'year':      return [iso(new Date(y, 0, 1)), t];
+    default:          return [t, t];
+  }
+}
+
+/* ---------- Reports screen ---------- */
+var _rptPeriod = 'month', _rptFrom = '', _rptTo = '';
+function viewReports(){
+  const c = document.getElementById('content');
+  let from, to;
+  if (_rptPeriod === 'custom') { from = _rptFrom || _localISO(); to = _rptTo || _localISO(); if (to < from) { const x = from; from = to; to = x; } }
+  else { const r = _periodRange(_rptPeriod); from = r[0]; to = r[1]; }
+  const S = salesSummary(from, to), exp = _expensesInRange(from, to);
+  const periods = [['today','Today'],['yesterday','Yesterday'],['week','This week'],['month','This month'],['lastmonth','Last month'],['year','This year'],['custom','Custom']];
+  const shopNote = _multiShop() ? '<span class="pill ' + (State.shopId ? 'sent' : 'draft') + '">' + (State.shopId ? esc(_shopName(State.shopId)) + ' · POS sales' : 'All shops') + '</span>' : '';
+  // daily (or monthly for long ranges)
+  const days = Math.round((new Date(to + 'T12:00:00') - new Date(from + 'T12:00:00')) / 86400000) + 1;
+  const byMonth = days > 62, bucket = function(d){ return byMonth ? d.slice(0, 7) : d; };
+  const rows = {};
+  S.pos.forEach(function(t){ const k = bucket(t.date); const r = rows[k] = rows[k] || { pos:0, posN:0, inv:0, invN:0 }; r.pos += t.totals.total; r.posN++; });
+  S.inv.forEach(function(i){ const k = bucket(i.paidDate || i.date); const r = rows[k] = rows[k] || { pos:0, posN:0, inv:0, invN:0 }; r.inv += i.totals.total; r.invN++; });
+  const keys = Object.keys(rows).sort().reverse();
+  // products
+  const prod = {};
+  S.pos.concat(S.inv).forEach(function(d){ (d.lineItems || []).forEach(function(li){
+    const k = li.itemId || li.name; const p = prod[k] = prod[k] || { name:li.name || 'Item', qty:0, sales:0, cost:0 };
+    p.qty += +li.qty || 0; p.sales += +li.amount || ((+li.qty || 0) * (+li.unitPrice || 0)); p.cost += _costOf(li); }); });
+  const top = Object.values(prod).sort(function(a, b){ return b.sales - a.sales; }).slice(0, 15);
+  // payment methods
+  const pay = {};
+  S.pos.forEach(function(t){ const k = t.paymentMethod || 'cash'; pay[k] = (pay[k] || 0) + t.totals.total; });
+  if (S.invTotal) pay['invoices (paid)'] = S.invTotal;
+  // shops & staff (POS)
+  const shopRows = {}, staff = {};
+  if (_multiShop() && !State.shopId) _posInRange(from, to, true).forEach(function(t){ const k = t.shopId || _mainShopId(); const r = shopRows[k] = shopRows[k] || { n:0, total:0 }; r.n++; r.total += t.totals.total; });
+  S.pos.forEach(function(t){ const k = t.cashier || '—'; const r = staff[k] = staff[k] || { n:0, total:0 }; r.n++; r.total += t.totals.total; });
+  const tbl = function(head, body){ return body ? '<div class="tbl"><table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>' : '<div class="muted" style="font-size:13px;padding:8px 2px">No sales in this period.</div>'; };
+  const sec = function(t, inner){ return '<div class="rpt-sec"><h3>' + t + '</h3>' + inner + '</div>'; };
+  c.innerHTML =
+    '<div class="tabs" style="margin-bottom:10px">' + periods.map(function(p){ return '<button class="' + (_rptPeriod === p[0] ? 'active' : '') + '" onclick="_rptPeriod=\'' + p[0] + '\';viewReports()">' + p[1] + '</button>'; }).join('') + '</div>' +
+    '<div class="between" style="gap:10px;flex-wrap:wrap;margin-bottom:12px">' +
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+        (_rptPeriod === 'custom'
+          ? '<input type="date" value="' + from + '" onchange="_rptFrom=this.value;viewReports()" class="rpt-date"><span class="muted">to</span><input type="date" value="' + to + '" onchange="_rptTo=this.value;viewReports()" class="rpt-date">'
+          : '<b>' + fmtDate(from) + (from !== to ? ' – ' + fmtDate(to) : '') + '</b>') + ' ' + shopNote + '</div>' +
+      '<button class="btn ghost sm" onclick="exportSalesCSV(\'' + from + '\',\'' + to + '\')">Download CSV</button></div>' +
+    '<div class="grid kpis" style="margin-bottom:14px">' +
+      '<div class="card kpi"><div class="lbl">Total sales</div><div class="val">' + money(S.total) + '</div><div class="sub muted">' + S.count + ' sale' + (S.count === 1 ? '' : 's') + ' · avg ' + money(S.avg) + '</div></div>' +
+      '<div class="card kpi"><div class="lbl">POS sales</div><div class="val">' + money(S.posTotal) + '</div><div class="sub muted">' + S.posCount + ' receipts</div></div>' +
+      '<div class="card kpi"><div class="lbl">Invoices paid</div><div class="val">' + money(S.invTotal) + '</div><div class="sub muted">' + S.invCount + ' invoices</div></div>' +
+      '<div class="card kpi"><div class="lbl">GST collected</div><div class="val">' + money(S.tax) + '</div><div class="sub muted">in the totals above</div></div>' +
+    '</div>' +
+    sec('Profit &amp; loss',
+      '<div class="card pl-card">' +
+        '<div class="pl-row"><span class="lbl">Sales (excluding GST)</span><span class="amt">' + money(S.net) + '</span></div>' +
+        '<div class="pl-row"><span class="lbl">Cost of goods sold <span class="muted" style="font-size:11.5px">(at current cost prices)</span></span><span class="amt" style="color:var(--danger)">−' + money(S.cogs) + '</span></div>' +
+        '<div class="pl-row"><span class="lbl" style="font-weight:700">Gross profit</span><span class="amt" style="font-weight:700">' + money(S.grossProfit) + '</span></div>' +
+        '<div class="pl-row"><span class="lbl">Expenses</span><span class="amt" style="color:var(--danger)">−' + money(exp) + '</span></div>' +
+        '<div class="pl-row ' + (S.grossProfit - exp >= 0 ? 'pl-net-pos' : 'pl-net-neg') + '"><span class="lbl" style="font-weight:700">Net profit</span><span class="amt">' + money(Math.abs(_r2(S.grossProfit - exp))) + (S.grossProfit - exp < 0 ? ' loss' : '') + '</span></div>' +
+      '</div>') +
+    sec(byMonth ? 'Sales by month' : 'Sales by day', tbl('<th>' + (byMonth ? 'Month' : 'Date') + '</th><th class="right">POS</th><th class="right">Invoices</th><th class="right">Total</th>',
+      keys.map(function(k){ const r = rows[k];
+        return '<tr><td><b>' + (byMonth ? _monthLabel(k) : fmtDate(k)) + '</b></td><td class="right mono">' + money(r.pos) + ' <span class="muted" style="font-size:11px">(' + r.posN + ')</span></td>' +
+          '<td class="right mono">' + money(r.inv) + ' <span class="muted" style="font-size:11px">(' + r.invN + ')</span></td><td class="right mono" style="font-weight:700">' + money(r.pos + r.inv) + '</td></tr>'; }).join(''))) +
+    sec('Top products', tbl('<th>Product</th><th class="right">Qty sold</th><th class="right">Sales</th><th class="right">Profit</th>',
+      top.map(function(p){ return '<tr><td><b>' + esc(p.name) + '</b></td><td class="right">' + _r2(p.qty) + '</td><td class="right mono">' + money(p.sales) + '</td><td class="right mono">' + (p.cost ? money(_r2(p.sales - p.cost)) : '<span class="muted">no cost</span>') + '</td></tr>'; }).join(''))) +
+    '<div class="rpt-two">' +
+      sec('Payment methods', tbl('<th>Method</th><th class="right">Amount</th>', Object.keys(pay).map(function(k){ return '<tr><td><b>' + esc(k.charAt(0).toUpperCase() + k.slice(1)) + '</b></td><td class="right mono">' + money(pay[k]) + '</td></tr>'; }).join(''))) +
+      sec('POS sales by staff', tbl('<th>Staff</th><th class="right">Receipts</th><th class="right">Amount</th>', Object.keys(staff).map(function(k){ return '<tr><td><b>' + esc(k) + '</b></td><td class="right">' + staff[k].n + '</td><td class="right mono">' + money(staff[k].total) + '</td></tr>'; }).join(''))) +
+    '</div>' +
+    (Object.keys(shopRows).length ? sec('POS sales by shop', tbl('<th>Shop</th><th class="right">Receipts</th><th class="right">Amount</th>', Object.keys(shopRows).map(function(k){ return '<tr><td><b>' + esc(_shopName(k)) + '</b></td><td class="right">' + shopRows[k].n + '</td><td class="right mono">' + money(shopRows[k].total) + '</td></tr>'; }).join(''))) : '') +
+    (_multiShop() && State.shopId && S.invCount ? '<p class="muted" style="font-size:12px">Invoices belong to the whole business, so they are included for every shop.</p>' : '');
+  renderIcons(c);
+}
+function _csvCell(v){ v = v === undefined || v === null ? '' : String(v); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+function exportSalesCSV(from, to){
+  const S = salesSummary(from, to);
+  const lines = [['Type','Number','Date','Time','Customer','Shop','Staff','Payment','Subtotal','GST','Total'].join(',')];
+  S.pos.forEach(function(t){ lines.push(['POS sale', t.number, t.date, t.time || '', t.customer || 'Walk-in', _multiShop() ? _shopName(t.shopId) : '', t.cashier || '', t.paymentMethod || 'cash',
+    _r2(t.totals.subtotal !== undefined ? t.totals.subtotal : t.totals.sub), _r2(t.totals.tax), _r2(t.totals.total)].map(_csvCell).join(',')); });
+  S.inv.forEach(function(i){ lines.push(['Invoice', i.number, i.paidDate || i.date, '', (i.customer && i.customer.name) || '', '', '', 'invoice',
+    _r2(i.totals.subtotal), _r2(i.totals.tax), _r2(i.totals.total)].map(_csvCell).join(',')); });
+  const blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type:'text/csv;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'sales_' + from + '_to_' + to + '.csv';
+  document.body.appendChild(a); a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  toast('Sales CSV downloaded (' + S.count + ' rows)');
+}
+
+/* ============================================================
+   BULK PRODUCT UPLOAD — CSV or Excel (.xlsx/.xls)
+   Template columns: name, sku, barcode, unit, description, cost_price, selling_price, taxable, track_stock, stock, reorder_level, reorder_qty
+   ============================================================ */
+var _bulkRows = [];
+const BULK_COLS = [
+  { key:'name',     label:'name',          aliases:['name','product','product name','item','item name','description1'] },
+  { key:'sku',      label:'sku',           aliases:['sku','code','item code','product code','ref'] },
+  { key:'barcode',  label:'barcode',       aliases:['barcode','ean','upc','bar code'] },
+  { key:'unit',     label:'unit',          aliases:['unit','uom','unit of measure','units'] },
+  { key:'desc',     label:'description',   aliases:['description','details','desc','notes'] },
+  { key:'cost',     label:'cost_price',    aliases:['cost_price','cost','cost price','buying price','purchase price'] },
+  { key:'price',    label:'selling_price', aliases:['selling_price','price','selling price','sale price','unit price','retail price','mrp'] },
+  { key:'taxable',  label:'taxable',       aliases:['taxable','gst','tax','gst applicable'] },
+  { key:'track',    label:'track_stock',   aliases:['track_stock','track stock','track','stock tracked'] },
+  { key:'stock',    label:'stock',         aliases:['stock','qty','quantity','opening stock','opening_stock','stock qty','on hand'] },
+  { key:'reorder',  label:'reorder_level', aliases:['reorder_level','reorder level','reorder','min stock','minimum stock'] },
+  { key:'reorderQty', label:'reorder_qty', aliases:['reorder_qty','reorder qty','reorder quantity','order qty'] }
+];
+function _norm(h){ return String(h || '').replace(/^\uFEFF/, '').trim().toLowerCase().replace(/[_\-]+/g, ' ').replace(/\s+/g, ' '); }
+function _num(v){ if (v === '' || v === null || v === undefined) return null; const c = String(v).replace(/[^0-9.\-]/g, ''); if (!/\d/.test(c)) return NaN; const n = +c; return isNaN(n) ? NaN : n; }
+function _yes(v, def){ if (v === '' || v === null || v === undefined) return def; const s = String(v).trim().toLowerCase(); return ['yes','y','true','1','x'].indexOf(s) >= 0 ? true : ['no','n','false','0'].indexOf(s) >= 0 ? false : def; }
+
+/* RFC-4180 CSV parser (quotes, commas/semicolons, line breaks inside quotes) */
+function parseCSV(text){
+  text = String(text).replace(/^\uFEFF/, '');
+  const first = text.split(/\r?\n/)[0] || '';
+  const delim = (first.split(';').length > first.split(',').length && first.split(';').length > first.split('\t').length) ? ';' : (first.split('\t').length > first.split(',').length ? '\t' : ',');
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) {
+      if (ch === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; }
+      else cell += ch;
+    } else if (ch === '"') q = true;
+    else if (ch === delim) { row.push(cell); cell = ''; }
+    else if (ch === '\n' || ch === '\r') { if (ch === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
+    else cell += ch;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter(function(r){ return r.some(function(c){ return String(c).trim() !== ''; }); });
+}
+function downloadProductTemplate(){
+  const head = BULK_COLS.map(function(c){ return c.label; }).join(',');
+  const ex = ['Rice 5kg,RICE-5,8901234500011,bag,Basmati long grain,70,100,yes,yes,40,5,20',
+              'Bottled water 1.5L,WATER-15,,pc,,4.5,8,yes,yes,120,24,96',
+              'Delivery charge,DEL,,pc,Service — no stock,0,25,yes,no,,,'];
+  const blob = new Blob(['\uFEFF' + head + '\r\n' + ex.join('\r\n') + '\r\n'], { type:'text/csv;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'bizz-master-products-template.csv';
+  document.body.appendChild(a); a.click(); setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+function openBulkUpload(){
+  _bulkRows = [];
+  openModal('Bulk product upload',
+    '<p style="font-size:13.5px;margin-bottom:10px">Add or update many products at once from a <b>CSV</b> or <b>Excel</b> file. The first row must be the column names.</p>' +
+    '<button class="btn ghost sm" onclick="downloadProductTemplate()">Download template (CSV)</button>' +
+    '<label class="slip-drop" style="margin-top:12px"><input type="file" accept=".csv,.txt,.xlsx,.xls,text/csv" style="display:none" onchange="_bulkFile(this.files[0])">' +
+      '<span id="bulk_lbl">Tap to choose a .csv or .xlsx file</span></label>' +
+    '<div class="fgrid" style="margin-top:12px">' +
+      '<div class="field"><label>If a product already exists</label><select id="bulk_mode" onchange="_bulkRender()"><option value="update">Update it</option><option value="skip">Skip it</option></select></div>' +
+      '<div class="field"><label>Stock column</label><select id="bulk_stock" onchange="_bulkRender()"><option value="set">Set stock to this quantity</option><option value="add">Add to current stock</option><option value="ignore">Ignore stock</option></select></div>' +
+      (_multiShop() ? '<div class="field"><label>Put stock into</label><select id="bulk_shop">' + _activeShops().map(function(s){ return '<option value="' + s.id + '"' + (s.id === (State.shopId || _defaultShopId()) ? ' selected' : '') + '>' + esc(s.name) + '</option>'; }).join('') + '</select></div>' : '') +
+    '</div>' +
+    '<p class="muted" style="font-size:12px">Existing products are matched by SKU, then barcode, then exact name. Columns: ' + BULK_COLS.map(function(c){ return c.label; }).join(', ') + '. Only <b>name</b> and <b>selling_price</b> are required.</p>' +
+    '<div id="bulk_preview"></div>',
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:'Import products', cls:'accent', fn:runBulkImport}], 'lg');
+}
+function _loadSheetJS(){
+  return new Promise(function(res, rej){
+    if (window.XLSX) return res(window.XLSX);
+    const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+    s.onload = function(){ window.XLSX ? res(window.XLSX) : rej(new Error('Excel reader did not load')); };
+    s.onerror = function(){ rej(new Error('Could not load the Excel reader — check your internet, or save the file as CSV')); };
+    document.head.appendChild(s);
+  });
+}
+async function _bulkFile(file){
+  if (!file) return;
+  const lbl = document.getElementById('bulk_lbl'); if (lbl) lbl.textContent = 'Reading ' + file.name + '…';
+  let rows;
+  try {
+    if (/\.(xlsx|xls)$/i.test(file.name)) {
+      const X = await _loadSheetJS();
+      const wb = X.read(new Uint8Array(await file.arrayBuffer()), { type:'array' });
+      rows = X.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header:1, raw:false, defval:'' });
+      rows = rows.filter(function(r){ return r.some(function(c){ return String(c).trim() !== ''; }); });
+    } else rows = parseCSV(await file.text());
+  } catch(e) { if (lbl) lbl.textContent = 'Could not read the file: ' + e.message; return; }
+  if (!rows || rows.length < 2) { if (lbl) lbl.textContent = 'The file has no product rows.'; return; }
+  const head = rows[0].map(_norm), map = {};
+  BULK_COLS.forEach(function(c){ const ix = head.findIndex(function(h){ return c.aliases.indexOf(h) >= 0; }); if (ix >= 0) map[c.key] = ix; });
+  if (map.name === undefined || map.price === undefined) {
+    if (lbl) lbl.textContent = 'Could not find the “name” and “selling_price” columns. Use the template’s first row.'; _bulkRows = []; _bulkRender(); return;
+  }
+  _bulkRows = rows.slice(1).map(function(r, n){
+    const g = function(k){ return map[k] === undefined ? '' : String(r[map[k]] === undefined ? '' : r[map[k]]).trim(); };
+    return { line:n + 2, name:g('name'), sku:g('sku'), barcode:g('barcode'), unit:g('unit'), desc:g('desc'), cost:_num(g('cost')), price:_num(g('price')),
+      taxable:_yes(g('taxable'), true), track:_yes(g('track'), true), stock:_num(g('stock')), reorder:_num(g('reorder')), reorderQty:_num(g('reorderQty')),
+      hasCol:{ cost:map.cost !== undefined, taxable:map.taxable !== undefined, track:map.track !== undefined, unit:map.unit !== undefined, desc:map.desc !== undefined, reorder:map.reorder !== undefined, reorderQty:map.reorderQty !== undefined, sku:map.sku !== undefined, barcode:map.barcode !== undefined } };
+  });
+  if (lbl) lbl.textContent = '\u2713 ' + file.name + ' — ' + _bulkRows.length + ' rows (tap to choose another file)';
+  _bulkRender();
+}
+function _bulkMatch(r, seen){
+  const items = State.db.items || [], low = function(s){ return String(s || '').trim().toLowerCase(); };
+  return (r.sku && items.find(function(i){ return low(i.sku) === low(r.sku); })) ||
+         (r.barcode && items.find(function(i){ return low(i.barcode) === low(r.barcode); })) ||
+         items.find(function(i){ return low(i.name) === low(r.name); }) || (seen[low(r.sku) || low(r.name)] || null);
+}
+function _bulkCheck(){
+  const seen = {}, mode = val('bulk_mode') || 'update';
+  return _bulkRows.map(function(r){
+    let err = '';
+    if (!r.name) err = 'Missing name';
+    else if (r.price === null || isNaN(r.price) || r.price < 0) err = 'Selling price missing or not a number';
+    else if ((r.cost !== null && isNaN(r.cost)) || (r.stock !== null && isNaN(r.stock))) err = 'Cost or stock is not a number';
+    const key = String(r.sku || r.name).trim().toLowerCase();
+    if (!err && seen[key]) err = 'Duplicate of line ' + seen[key].line + ' in this file';
+    const match = err ? null : _bulkMatch(r, {});
+    const status = err ? 'error' : match ? (mode === 'skip' ? 'skip' : 'update') : 'new';
+    if (!err) seen[key] = r;
+    return Object.assign({}, r, { err:err, match:match, status:status });
+  });
+}
+function _bulkRender(){
+  const host = document.getElementById('bulk_preview'); if (!host) return;
+  if (!_bulkRows.length) { host.innerHTML = ''; return; }
+  const checked = _bulkCheck(), cnt = { new:0, update:0, skip:0, error:0 };
+  checked.forEach(function(r){ cnt[r.status]++; });
+  const pill = { new:'<span class="pill paid">New</span>', update:'<span class="pill sent">Update</span>', skip:'<span class="pill draft">Skip</span>', error:'<span class="pill overdue">Error</span>' };
+  host.innerHTML = '<div class="bulk-sum"><span><b>' + cnt.new + '</b> new</span><span><b>' + cnt.update + '</b> to update</span>' + (cnt.skip ? '<span><b>' + cnt.skip + '</b> skipped</span>' : '') + '<span class="' + (cnt.error ? 'bad' : '') + '"><b>' + cnt.error + '</b> with errors (not imported)</span></div>' +
+    '<div class="tbl" style="max-height:320px;overflow:auto"><table><thead><tr><th>Line</th><th>Product</th><th class="right">Price</th><th class="right">Stock</th><th>Result</th></tr></thead><tbody>' +
+    checked.slice(0, 200).map(function(r){
+      return '<tr><td class="muted">' + r.line + '</td><td><b>' + esc(r.name || '—') + '</b>' + (r.sku ? '<div class="muted" style="font-size:11.5px">' + esc(r.sku) + '</div>' : '') + '</td>' +
+        '<td class="right mono">' + (r.price === null || isNaN(r.price) ? '—' : num(r.price)) + '</td><td class="right">' + (r.track === false ? '<span class="muted">not tracked</span>' : (r.stock === null || isNaN(r.stock) ? '—' : r.stock)) + '</td>' +
+        '<td>' + pill[r.status] + (r.err ? '<div style="font-size:11.5px;color:var(--danger)">' + esc(r.err) + '</div>' : '') + '</td></tr>';
+    }).join('') + '</tbody></table></div>' + (checked.length > 200 ? '<p class="muted" style="font-size:12px">Showing the first 200 of ' + checked.length + ' rows.</p>' : '');
+}
+function runBulkImport(){
+  if (!_bulkRows.length) return toast('Choose a file first');
+  const checked = _bulkCheck(), mode = val('bulk_mode') || 'update', stockMode = val('bulk_stock') || 'set';
+  const shop = (document.getElementById('bulk_shop') || {}).value || State.shopId || _defaultShopId();
+  const todo = checked.filter(function(r){ return r.status === 'new' || r.status === 'update'; });
+  if (!todo.length) return toast('Nothing to import — fix the errors and try again');
+  const backup = JSON.stringify(State.db.items), backupMv = JSON.stringify(State.db.stockMovements || []), backupU = JSON.stringify(State.db.settings.uoms || []);
+  const uoms = State.db.settings.uoms = State.db.settings.uoms || [];
+  let added = 0, updated = 0;
+  todo.forEach(function(r){
+    if (r.unit && uoms.indexOf(r.unit) < 0) uoms.push(r.unit);
+    let it = r.status === 'update' ? r.match : null;
+    if (!it) {
+      it = { id:uid(), name:r.name, sku:r.sku, barcode:r.barcode, unit:r.unit || 'pc', desc:r.desc, costPrice:r.cost || 0, unitPrice:r.price,
+        taxable:r.taxable, trackStock:r.track, stockQty:0, shopStock:{}, reorderLevel:r.reorder || 0, reorderQty:r.reorderQty || 0 };
+      State.db.items.push(it); added++;
+    } else {
+      it.name = r.name; it.unitPrice = r.price;
+      if (r.hasCol.sku && r.sku) it.sku = r.sku; if (r.hasCol.barcode && r.barcode) it.barcode = r.barcode;
+      if (r.hasCol.unit && r.unit) it.unit = r.unit; if (r.hasCol.desc) it.desc = r.desc;
+      if (r.hasCol.cost && r.cost !== null) it.costPrice = r.cost; if (r.hasCol.taxable) it.taxable = r.taxable;
+      if (r.hasCol.track) it.trackStock = r.track;
+      if (r.hasCol.reorder && r.reorder !== null) it.reorderLevel = r.reorder; if (r.hasCol.reorderQty && r.reorderQty !== null) it.reorderQty = r.reorderQty;
+      updated++;
+    }
+    if (it.trackStock !== false && stockMode !== 'ignore' && r.stock !== null && !isNaN(r.stock)) {
+      const delta = stockMode === 'add' ? r.stock : r.stock - qtyIn(it, shop);
+      if (delta) addStockMovement(it.id, delta > 0 ? 'receive' : 'adjust', delta, 'IMPORT', 'Bulk upload', shop);
+    }
+  });
+  // Firestore keeps one business in one document (max 1 MB)
+  if (JSON.stringify(State.db).length > 950000) {
+    State.db.items = JSON.parse(backup); State.db.stockMovements = JSON.parse(backupMv); State.db.settings.uoms = JSON.parse(backupU);
+    return toast('Too much data for one business (1 MB limit). Import fewer products, or remove product photos.');
+  }
+  persist(); closeModal(); _bulkRows = [];
+  toast(added + ' product' + (added === 1 ? '' : 's') + ' added, ' + updated + ' updated' + (checked.length - todo.length ? ', ' + (checked.length - todo.length) + ' not imported' : ''));
+  if (State.view === 'items') viewItems();
 }

@@ -639,3 +639,16 @@ table{width:100%;border-collapse:collapse}
 @media(min-width:901px){.pay-in{width:80px}}
 .field .pro-period{display:flex;flex-direction:column;gap:2px;margin:0;font-size:14px;font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink)}
 .field .pro-period b{font-size:14px}
+
+/* ---- Reports ---- */
+.rpt-sec{margin-bottom:18px}
+.rpt-sec h3{font-size:14.5px;margin:0 0 8px}
+.rpt-two{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:0 16px}
+.rpt-date{padding:7px 9px;border:1px solid var(--line);border-radius:9px}
+.pl-card{overflow:hidden}
+/* ---- Bulk upload ---- */
+.bulk-sum{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 8px}
+.bulk-sum span{background:var(--paper);border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:12.5px}
+.bulk-sum span.bad{color:var(--danger);border-color:var(--danger)}
+@media(max-width:600px){.items-actions{flex-wrap:wrap;flex-shrink:1!important;width:100%}.items-actions .btn{flex:1 1 auto}}
+.pl-row .amt,.content .amt,.mono{overflow-wrap:normal;white-space:nowrap}
