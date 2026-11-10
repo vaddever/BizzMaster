@@ -561,3 +561,20 @@ table{width:100%;border-collapse:collapse}
   #content .tbl td,#content .tbl td *{overflow-wrap:anywhere}
   #content .tbl td .btn,#content .tbl td .pill,#content .tbl td select{overflow-wrap:normal}
 }
+
+/* ---- Business switcher ---- */
+.biz-caret{font-size:11px;color:var(--ink-soft);margin-left:2px}
+.biz-sec{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-soft);margin:14px 2px 6px}
+.biz-sec:first-child{margin-top:0}
+.biz-row{display:flex;align-items:center;gap:11px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;margin-bottom:8px;cursor:pointer;background:var(--card);transition:.12s}
+.biz-row:hover{border-color:var(--accent);background:var(--accent-soft)}
+.biz-row.cur{border-color:var(--accent);background:var(--accent-soft);cursor:default}
+.biz-row-av{width:36px;height:36px;border-radius:10px;background:var(--accent);color:#fff;display:grid;place-items:center;font-weight:700;flex-shrink:0}
+.biz-row-txt{flex:1;min-width:0;display:flex;flex-direction:column}
+.biz-row-txt b{font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.biz-row-txt .muted{font-size:12px}
+.biz-row-go{font-size:22px;color:var(--ink-soft)}
+/* Stacked cards: title cell stacks its lines (e.g. name above email) */
+@media(max-width:900px){
+  #content .tbl tbody td:first-child{flex-direction:column;align-items:flex-start;gap:2px}
+}

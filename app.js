@@ -232,86 +232,246 @@ function starterDb(businessName, email) {
     stockMovements:[], stockAudits:[], zakatRecords:[], invitedUsers:[]
   };
 }
-function computePlan(pi) {
-  if (!pi) return 'trial';
-  if (pi.plan === 'pro') return 'pro';
-  const exp = pi.trialExpiry
-    ? (pi.trialExpiry.toDate ? pi.trialExpiry.toDate() : new Date(pi.trialExpiry))
-    : null;
-  return (exp && exp > new Date()) ? 'trial' : 'free';
-}
-function computeDaysLeft(pi) {
-  if (!pi || !pi.trialExpiry) return 0;
-  const exp = pi.trialExpiry.toDate ? pi.trialExpiry.toDate() : new Date(pi.trialExpiry);
-  return Math.max(0, Math.ceil((exp - new Date()) / 86400000));
-}
-/* ---------- Team invitations: accept an invite link and become a member of the owner's business ---------- */
+/* ============================================================
+   ACCOUNTS & BUSINESSES
+   - An account can own several businesses (registry: biz_index/{bizId} → ownerUid, name).
+     The first business keeps the account uid as its id (older data stays where it is).
+   - An account can also be a team member of other businesses: members/{bizId}_{memberUid}.
+   - Switch between them from the business name in the top bar.
+   ============================================================ */
+function _lastBizKey(){ return 'bm_last_biz_' + (State.user ? State.user.uid : ''); }
+
+/* Accept an invite link: become a member of that specific business */
 async function _acceptInvite(user, code){
   const ref  = _fdb.collection('invites').doc(code);
   const snap = await ref.get();
   if (!snap.exists) return { ok:false, msg:'This invitation link is no longer valid.' };
   const inv = snap.data();
   if (inv.status !== 'pending') return { ok:false, msg:'This invitation has already been used.' };
-  const em = (user.email||'').toLowerCase();
+  const em = (user.email || '').toLowerCase();
   if (inv.email && inv.email !== em) return { ok:false, msg:'This invitation was sent to ' + inv.email + '. Please sign in with that email address.' };
-  await _fdb.collection('members').doc(user.uid).set({
-    ownerUid: inv.ownerUid, ownerName: inv.ownerName || '', role: inv.role || 'manager',
-    email: em, name: inv.name || '', code: code, joinedAt: new Date().toISOString()
+  const bizId = inv.bizId || inv.ownerUid;
+  await _fdb.collection('members').doc(bizId + '_' + user.uid).set({
+    bizId: bizId, ownerUid: inv.ownerUid, memberUid: user.uid, role: inv.role || 'manager',
+    email: em, name: inv.name || '', bizName: inv.bizName || inv.ownerName || '', code: code, joinedAt: new Date().toISOString()
   });
   await ref.update({ status:'accepted', acceptedBy:user.uid, acceptedAt:new Date().toISOString() });
-  return { ok:true };
+  return { ok:true, bizId: bizId, bizName: inv.bizName || inv.ownerName || '' };
 }
 
+/* Every business this account can open: its own + ones shared with it */
+async function _listMyBusinesses(){
+  const uid = State.user.uid, out = [], seen = {};
+  const add = function(e){ if (e.bizId && !seen[e.bizId]) { seen[e.bizId] = 1; out.push(e); } };
+  try {
+    const s = await _fdb.collection('biz_index').where('ownerUid', '==', uid).get();
+    s.docs.forEach(function(d){ const x = d.data(); add({ bizId:d.id, name:x.name || 'Business', ownerUid:uid, role:'owner', createdAt:x.createdAt || '' }); });
+  } catch(e) { console.warn('biz_index:', e.message); }
+  if (!seen[uid]) {   // first business from before the registry existed
+    try { const b = await _fdb.collection('businesses').doc(uid).get();
+      if (b.exists) add({ bizId:uid, name:((b.data().settings || {}).businessName) || 'My business', ownerUid:uid, role:'owner', createdAt:'' }); } catch(e) {}
+  }
+  try {
+    const s = await _fdb.collection('members').where('memberUid', '==', uid).get();
+    s.docs.forEach(function(d){ const m = d.data(); add({ bizId:m.bizId, name:m.bizName || m.ownerName || 'Shared business', ownerUid:m.ownerUid, role:m.role || 'manager', member:true, memberDoc:d.id }); });
+  } catch(e) { console.warn('members:', e.message); }
+  try {   // older single-business membership format
+    const l = await _fdb.collection('members').doc(uid).get();
+    if (l.exists) { const m = l.data(); add({ bizId:m.ownerUid, name:m.ownerName || 'Shared business', ownerUid:m.ownerUid, role:m.role || 'manager', member:true, memberDoc:uid }); }
+  } catch(e) {}
+  // own businesses first (primary first), then shared
+  out.sort(function(a, b){ return (a.member?1:0) - (b.member?1:0) || (a.bizId===uid?-1:b.bizId===uid?1:0) || String(a.createdAt).localeCompare(String(b.createdAt)); });
+  State.bizList = out;
+  return out;
+}
+
+/* Keep the registry entry (name) for a business this account owns */
+function _ensureBizIndex(){
+  if (State.isMember || !State.bizUid || !State.user) return;
+  const name = (State.db && State.db.settings && State.db.settings.businessName) || 'Business';
+  _fdb.collection('biz_index').doc(State.bizUid).set({ bizId:State.bizUid, ownerUid:State.user.uid, name:name, updatedAt:new Date().toISOString() }, { merge:true })
+    .catch(function(e){ console.warn('biz_index sync:', e.message); });
+  const me = (State.bizList || []).find(function(b){ return b.bizId === State.bizUid; }); if (me) me.name = name;
+}
+
+/* Open one business: load its data and its owner's subscription */
+async function openBusiness(entry){
+  const isOwn = !entry.member;
+  const [bizSnap, planSnap] = await Promise.all([
+    _fdb.collection('businesses').doc(entry.bizId).get(),
+    isOwn ? Promise.resolve(null) : _fdb.collection('plan_info').doc(entry.ownerUid).get().catch(function(){ return null; })
+  ]);
+  if (!isOwn && !bizSnap.exists) throw new Error('This business no longer exists.');
+  const pi = isOwn ? State.account : ((planSnap && planSnap.exists) ? planSnap.data() : null);
+  if (!isOwn && pi && pi.suspended && !State.isAdmin) throw new Error('The account that owns ' + (entry.name || 'this business') + ' is suspended.');
+  State.db = bizSnap.exists ? bizSnap.data() : starterDb(State.user.displayName || entry.name || '', State.user.email);
+  State.bizUid = entry.bizId;
+  State.bizOwnerUid = entry.ownerUid;
+  State.isMember = !isOwn;
+  State.memberRole = isOwn ? '' : (entry.role || 'manager');
+  State.ownerPlan = pi;
+  _applyPlan(true);
+  try { localStorage.setItem(_lastBizKey(), entry.bizId); } catch(e) {}
+  _resetModuleState();
+  document.getElementById('auth').style.display = 'none';
+  document.getElementById('app').style.display  = 'flex';
+  launchApp();
+  if (isOwn) _ensureBizIndex();
+}
+
+/* Work out the plan for the open business from its owner's subscription; tell the user when Pro ends */
+function _applyPlan(initial){
+  if (!State.db) return;
+  const pi = State.ownerPlan, before = State.db.settings.plan;
+  const plan = State.isAdmin ? 'pro' : computePlan(pi);
+  State.db.settings.plan = plan;
+  State.trialDaysLeft = State.isAdmin ? 0 : computeDaysLeft(pi);
+  State.proDaysLeft = State.isAdmin ? null : computeProDaysLeft(pi);
+  if (!initial && before === 'pro' && plan !== 'pro') toast('The Pro subscription has ended — Pro features are now locked.');
+  if (initial && plan === 'pro' && State.proDaysLeft !== null && State.proDaysLeft <= 7)
+    setTimeout(function(){ toast(State.proDaysLeft === 0 ? 'Pro subscription ends today.' : 'Pro subscription ends in ' + State.proDaysLeft + ' day' + (State.proDaysLeft===1?'':'s') + ' (' + fmtDate(pi.proUntil) + ').'); }, 1200);
+}
+
+/* Clear screen-level state so nothing carries over from the previous business */
+function _resetModuleState(){
+  try { posCart = []; posCashier = null; _posSearch = ''; } catch(e) {}
+  try { _customerOrders = []; _ordersFilter = 'all'; } catch(e) {}
+  try { _teamInvites = []; } catch(e) {}
+  try { editing = null; } catch(e) {}
+  State.view = 'dashboard';
+}
+
+/* Save the current business right away (used before switching) */
+async function _saveNow(){
+  clearTimeout(_saveT);
+  const uid = _bizUid();
+  if (!State.db || !uid || !_auth.currentUser) return;
+  try {
+    await _fdb.collection('businesses').doc(uid).set(State.db);
+    syncPortal(uid); syncPosPortal(uid);
+    const cbs = _afterSave.splice(0); cbs.forEach(function(f){ try{ f(); }catch(e){} });
+  } catch(e) { console.error('Save before switch failed', e); }
+}
+
+async function switchBusiness(bizId){
+  const entry = (State.bizList || []).find(function(b){ return b.bizId === bizId; });
+  if (!entry) return toast('Business not found');
+  if (bizId === State.bizUid) { closeModal(); return; }
+  closeModal(); toast('Opening ' + entry.name + '…');
+  await _saveNow();
+  stopPosQueueListener();
+  try { await openBusiness(entry); toast('Now working in ' + (State.db.settings.businessName || entry.name)); }
+  catch(e) { toast(e.message); }
+}
+
+/* ---------- Switcher (tap the business name in the top bar) ---------- */
+function _ownedCount(){ return (State.bizList || []).filter(function(b){ return !b.member; }).length; }
+function _canCreateBusiness(){
+  if (State.isAdmin || _ownedCount() === 0) return true;
+  const mode = moduleMode('multiBusiness');
+  return mode === 'free' || (mode === 'pro' && _accountIsPro());
+}
+async function openBizSwitcher(){
+  openModal('Your businesses', '<div class="muted" style="padding:14px 2px">Loading…</div>', [{label:'Close', cls:'ghost', fn:closeModal}], 'sm');
+  try { await _listMyBusinesses(); } catch(e) {}
+  const row = function(b){
+    const cur = b.bizId === State.bizUid;
+    return '<div class="biz-row' + (cur ? ' cur' : '') + '" onclick="' + (cur ? 'closeModal()' : 'switchBusiness(\'' + b.bizId + '\')') + '">' +
+      '<span class="biz-row-av">' + esc((b.name || '?')[0].toUpperCase()) + '</span>' +
+      '<span class="biz-row-txt"><b>' + esc(b.name) + '</b><span class="muted">' + (b.member ? 'Team member · ' + esc(b.role) : 'Owner') + '</span></span>' +
+      (cur ? '<span class="pill paid">Open</span>' : '<span class="biz-row-go">›</span>') +
+    '</div>';
+  };
+  const own = State.bizList.filter(function(b){ return !b.member; }), shared = State.bizList.filter(function(b){ return b.member; });
+  const canNew = _canCreateBusiness();
+  const body =
+    '<div class="biz-sec">My businesses</div>' + (own.length ? own.map(row).join('') : '<div class="muted" style="font-size:13px;padding:6px 2px">None yet.</div>') +
+    (shared.length ? '<div class="biz-sec">Shared with me</div>' + shared.map(row).join('') : '') +
+    '<div style="margin-top:14px">' + (canNew
+      ? '<button class="btn accent" style="width:100%" onclick="openNewBusiness()">' + svg('plus') + ' Create a new business</button>'
+      : '<button class="btn ghost" style="width:100%" onclick="closeModal();openUpgrade()">' + svg('lock') + ' More businesses need Pro</button>') +
+    '</div>' +
+    (State.isMember ? '<button class="btn ghost" style="width:100%;margin-top:8px;color:var(--danger)" onclick="leaveBusiness()">Leave ' + esc(State.db.settings.businessName || 'this business') + '</button>' : '');
+  const m = document.querySelector('#modal .modal-body'); if (m) { m.innerHTML = body; renderIcons(m); }
+}
+function openNewBusiness(){
+  if (!_canCreateBusiness()) { closeModal(); openUpgrade(); return; }
+  openModal('Create a new business',
+    '<div class="field"><label>Business name *</label><input id="nb_name" placeholder="e.g. Kleio Café"></div>' +
+    '<p class="muted" style="font-size:12.5px">It starts empty — its own products, customers, invoices, POS and settings. Switch between businesses any time from the top bar.</p>',
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:'Create business', cls:'accent', fn:createBusiness}], 'sm');
+  setTimeout(function(){ const i = document.getElementById('nb_name'); if (i) i.focus(); }, 50);
+}
+async function createBusiness(){
+  const name = val('nb_name').trim(); if (!name) return toast('Enter a business name');
+  if (!_canCreateBusiness()) { closeModal(); openUpgrade(); return; }
+  const uid = State.user.uid;
+  const id = _ownedCount() === 0 ? uid : 'b_' + _randCode(20);   // an account's first business uses the account id
+  try {
+    await _fdb.collection('biz_index').doc(id).set({ bizId:id, ownerUid:uid, name:name, createdAt:new Date().toISOString() });
+    const db = starterDb(name, State.user.email); db.ownerUid = uid;
+    await _fdb.collection('businesses').doc(id).set(db);
+    if (!State.account) {   // first own business for an account that only joined teams so far
+      const cfg = _platformCfg || {}, days = cfg.trialEnabled === false ? 0 : (+cfg.trialDays || TRIAL_DAYS);
+      const pi = { plan:'free', trialExpiry:new Date(Date.now() + days * 86400000), createdAt:new Date(), email:State.user.email, businessName:name };
+      await _fdb.collection('plan_info').doc(uid).set(pi).catch(function(e){ console.warn('plan_info create:', e.message); });
+      State.account = pi;
+    }
+  } catch(e) { return toast('Could not create the business: ' + e.message); }
+  closeModal();
+  await _listMyBusinesses();
+  await switchBusiness(id);
+}
+function leaveBusiness(){
+  const entry = (State.bizList || []).find(function(b){ return b.bizId === State.bizUid; });
+  if (!entry || !entry.member) return;
+  confirmDel('Leave ' + esc(entry.name) + '? You will lose access until you are invited again.', async function(){
+    try { await _fdb.collection('members').doc(entry.memberDoc).delete(); }
+    catch(e) { return toast('Could not leave: ' + e.message); }
+    stopPosQueueListener();
+    const rest = await _listMyBusinesses();
+    if (rest.length) { await openBusiness(rest[0]); toast('You left ' + entry.name); }
+    else { State.bizList = []; await openBusiness({ bizId:State.user.uid, ownerUid:State.user.uid, name:'My business', role:'owner' }); }
+  });
+}
+
+/* ---------- Sign-in: account → pick a business → open it ---------- */
 async function loadFirebaseUser(user) {
   try {
-    /* 1. Is this person on someone else's team? (or opening an invite link right now) */
-    let member = null, inviteNote = '';
-    try {
-      const mSnap = await _fdb.collection('members').doc(user.uid).get();
-      if (mSnap.exists) member = mSnap.data();
-    } catch(e) { console.warn('members lookup:', e.message); }
+    State.user = { email: user.email, uid: user.uid, displayName: user.displayName || '' };
+    State.isAdmin = (user.email || '').toLowerCase() === ADMIN_EMAIL.toLowerCase();
+    const [accSnap, cfgSnap] = await Promise.all([
+      _fdb.collection('plan_info').doc(user.uid).get().catch(function(){ return null; }),
+      _fdb.collection('platform_config').doc('settings').get().catch(function(){ return null; })
+    ]);
+    State.account = (accSnap && accSnap.exists) ? accSnap.data() : null;
+    _platformCfg = (cfgSnap && cfgSnap.exists) ? cfgSnap.data() : {};
+    if (State.account && State.account.suspended && !State.isAdmin) {
+      State.user = null;
+      await _auth.signOut();
+      document.getElementById('authErr').textContent = 'This account has been suspended. Please contact support.';
+      return;
+    }
+    /* invite link opened? join that business */
+    let joined = null, inviteNote = '';
     const code = _pendingInviteCode();
     if (code) {
-      if (!member) {
-        const r = await _acceptInvite(user, code).catch(function(e){ return { ok:false, msg:e.message }; });
-        if (r.ok) {
-          const m2 = await _fdb.collection('members').doc(user.uid).get();
-          member = m2.exists ? m2.data() : null;
-        } else inviteNote = r.msg || '';
-      }
+      const r = await _acceptInvite(user, code).catch(function(e){ return { ok:false, msg:e.message }; });
+      if (r.ok) joined = r.bizId; else inviteNote = r.msg || '';
       _clearPendingInvite();
     }
-
-    /* 2. Load the business data: the owner's if you're a team member, otherwise your own */
-    const bizUid = member ? member.ownerUid : user.uid;
-    const [bizSnap, planSnap, cfgSnap] = await Promise.all([
-      _fdb.collection('businesses').doc(bizUid).get(),
-      _fdb.collection('plan_info').doc(bizUid).get().catch(()=>null),
-      _fdb.collection('platform_config').doc('settings').get().catch(()=>null)
-    ]);
-    if (member && !bizSnap.exists) throw new Error('The business you were invited to could not be found.');
-    State.db = bizSnap.exists ? bizSnap.data() : starterDb(user.displayName||'', user.email);
-    const pi = (planSnap && planSnap.exists) ? planSnap.data() : null;
-    const isAdmin = !member && (user.email||'').toLowerCase() === ADMIN_EMAIL.toLowerCase();
-    State.isAdmin = isAdmin;
-    State.isMember = !!member;
-    State.memberRole = member ? (member.role || 'manager') : '';
-    State.bizUid = bizUid;
-    if (isAdmin) {
-      // Admin always has full Pro access
-      State.db.settings.plan = 'pro';
-      State.trialDaysLeft = 0;
-    } else {
-      State.db.settings.plan = computePlan(pi);
-      State.trialDaysLeft = computeDaysLeft(pi);
+    const list = await _listMyBusinesses();
+    let last = ''; try { last = localStorage.getItem(_lastBizKey()) || ''; } catch(e) {}
+    const pick = list.find(function(b){ return b.bizId === joined; }) || list.find(function(b){ return b.bizId === last; })
+      || list.find(function(b){ return b.bizId === user.uid; }) || list[0]
+      || { bizId:user.uid, ownerUid:user.uid, name:user.displayName || 'My business', role:'owner' };   // brand-new account
+    try { await openBusiness(pick); }
+    catch(e) {   // shared business unavailable — fall back to own business
+      inviteNote = e.message;
+      await openBusiness(list.find(function(b){ return !b.member; }) || { bizId:user.uid, ownerUid:user.uid, name:'My business', role:'owner' });
     }
-    State.user = { email: user.email, uid: user.uid };
-    _platformCfg = (cfgSnap && cfgSnap.exists) ? cfgSnap.data() : {};
-    document.getElementById('auth').style.display = 'none';
-    document.getElementById('app').style.display  = 'flex';
-    launchApp();
     if (inviteNote) setTimeout(function(){ toast(inviteNote); }, 900);
-    else if (member && code) setTimeout(function(){ toast('Welcome! You have joined ' + (member.ownerName || 'the team') + '.'); }, 900);
+    else if (joined) setTimeout(function(){ toast('Welcome! You have joined ' + (State.db.settings.businessName || 'the team') + '.'); }, 900);
   } catch(e) {
     document.getElementById('authErr').textContent = 'Could not load account: ' + e.message;
   }
@@ -336,15 +496,83 @@ function fbErrMsg(e) {
 var State={user:null,db:null,view:'dashboard',isAdmin:false,trialDaysLeft:0};
 var _platformCfg={};
 
-function isPro(){ const p=State.db?.settings?.plan; return p==='pro'||p==='trial'; }
+/* ============================================================
+   PLANS & SUBSCRIPTIONS (per account — applies to all of that account's businesses)
+   plan_info/{accountUid}: plan 'free'|'pro', proUntil 'YYYY-MM-DD' (inclusive), trialExpiry, subscriptions[], suspended
+   ============================================================ */
+function _localISO(d){ d = d || new Date(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); }
+function _toDate(v){ if (!v) return null; if (v.toDate) return v.toDate(); if (typeof v === 'object' && v.seconds) return new Date(v.seconds*1000); const d = new Date(v); return isNaN(d) ? null : d; }
+function _proActive(pi){ return !!pi && pi.plan === 'pro' && (!pi.proUntil || pi.proUntil >= _localISO()); }
+function computePlan(pi) {
+  if (!pi) return 'trial';
+  if (_proActive(pi)) return 'pro';
+  const exp = _toDate(pi.trialExpiry);
+  return (exp && exp > new Date()) ? 'trial' : 'free';
+}
+function computeDaysLeft(pi) {
+  const exp = pi && _toDate(pi.trialExpiry); if (!exp) return 0;
+  return Math.max(0, Math.ceil((exp - new Date()) / 86400000));
+}
+function computeProDaysLeft(pi){
+  if (!_proActive(pi) || !pi.proUntil) return null;
+  // whole calendar days from today to the last Pro day (0 = last day is today)
+  return Math.max(0, Math.round((new Date(pi.proUntil + 'T12:00:00') - new Date(_localISO() + 'T12:00:00')) / 86400000));
+}
+/* Describe an account's plan in words (used by the top bar and Portal Admin) */
+function planStatus(pi){
+  if (!pi) return { key:'trial', label:'Trial', detail:'' };
+  if (pi.suspended) return { key:'suspended', label:'Suspended', detail:'' };
+  if (_proActive(pi)) return pi.proUntil
+    ? { key:'pro', label:'Pro', detail:'until ' + fmtDate(pi.proUntil), days:computeProDaysLeft(pi) }
+    : { key:'pro', label:'Pro', detail:'no end date' };
+  if (pi.plan === 'pro' && pi.proUntil) return { key:'expired', label:'Expired', detail:'ended ' + fmtDate(pi.proUntil) };
+  const t = computePlan(pi);
+  if (t === 'trial') return { key:'trial', label:'Trial', detail:computeDaysLeft(pi) + ' days left' };
+  return { key:'free', label:'Free', detail:'' };
+}
+function isPro(){ const p = State.db && State.db.settings && State.db.settings.plan; return p === 'pro' || p === 'trial'; }
+function _accountIsPro(){ return State.isAdmin || ['pro','trial'].indexOf(computePlan(State.account)) >= 0; }
 
-/* Which features require Pro by default, until admin overrides via Portal Admin
-   → Platform Settings → Pro Feature Configuration. true = Pro-only, false = free for everyone. */
-const DEFAULT_PRO_FEATURES={
-  stock:false, deliveries:true, email:true, team:true, expenses:false, zakat:false, gst:false, orders:false, multiEmployee:false
-};
-function proFeatures(){ return Object.assign({},DEFAULT_PRO_FEATURES,_platformCfg.proFeatures||{}); }
-function featureLocked(key){ if(State.isAdmin||isPro()) return false; return !!proFeatures()[key]; }
+/* ============================================================
+   MODULES — each can be Free for all, Pro only, or Off (hidden from everyone except the platform admin).
+   Set in Portal Admin → Platform Settings. Stored in platform_config/settings.modules.
+   ============================================================ */
+const MODULE_DEFS = [
+  { key:'items',      view:'items',      label:'Products',                         def:'free' },
+  { key:'stock',      view:'stock',      label:'Stock management',                 def:'free' },
+  { key:'customers',  view:'customers',  label:'Customers',                        def:'free' },
+  { key:'pos',        view:'pos',        label:'Point of Sale (POS)',              def:'free' },
+  { key:'employees',  view:'employees',  label:'Employees',                        def:'free' },
+  { key:'expenses',   view:'expenses',   label:'Expenses',                         def:'free' },
+  { key:'gst',        view:'gst',        label:'GST returns (MIRA 205)',           def:'free' },
+  { key:'zakat',      view:'zakat',      label:'Zakat calculator',                 def:'free' },
+  { key:'quotations', view:'quotations', label:'Quotations',                       def:'free' },
+  { key:'invoices',   view:'invoices',   label:'Invoices',                         def:'free' },
+  { key:'orders',     view:'orders',     label:'Customer orders',                  def:'free' },
+  { key:'deliveries', view:'deliveries', label:'Delivery notes',                   def:'pro'  },
+  { key:'email',      view:'email',      label:'Send documents by email & WhatsApp', def:'pro' },
+  { key:'team',       view:'team',       label:'Team access (invite staff logins)', def:'pro' },
+  { key:'multiEmployee', label:'Unlimited POS employees (beyond free limit)', def:'free', feature:true },
+  { key:'multiBusiness', label:'Several businesses in one account',          def:'pro',  feature:true }
+];
+const VIEW_FEATURE_MAP = {};
+MODULE_DEFS.forEach(function(m){ if (m.view) VIEW_FEATURE_MAP[m.view] = m.key; });
+const DEFAULT_PRO_FEATURES = {};   // kept for older code paths
+MODULE_DEFS.forEach(function(m){ DEFAULT_PRO_FEATURES[m.key] = m.def === 'pro'; });
+
+function moduleModes(){
+  const out = {}, cfg = _platformCfg || {};
+  MODULE_DEFS.forEach(function(m){ out[m.key] = m.def; });
+  const legacy = cfg.proFeatures || {};                               // older true/false settings
+  Object.keys(legacy).forEach(function(k){ if (k in out) out[k] = legacy[k] ? 'pro' : 'free'; });
+  const mods = cfg.modules || {};
+  Object.keys(mods).forEach(function(k){ if (k in out && ['free','pro','off'].indexOf(mods[k]) >= 0) out[k] = mods[k]; });
+  return out;
+}
+function moduleMode(key){ return moduleModes()[key] || 'free'; }
+function moduleOff(key){ return !State.isAdmin && moduleMode(key) === 'off'; }
+function proFeatures(){ const m = moduleModes(), o = {}; Object.keys(m).forEach(function(k){ o[k] = m[k] === 'pro'; }); return o; }
+function featureLocked(key){ if (State.isAdmin || isPro()) return false; return moduleMode(key) === 'pro'; }
 
 function blankDB(biz){
   return {
@@ -455,7 +683,8 @@ async function doAuth() {
       const trialExpiry = new Date(Date.now() + TRIAL_DAYS * 86400000);
       if (!joining) await Promise.all([
         _fdb.collection('plan_info').doc(cred.user.uid).set({plan:'free', trialExpiry, createdAt:new Date(), email, businessName:biz}),
-        _fdb.collection('businesses').doc(cred.user.uid).set(starterDb(biz, email))
+        _fdb.collection('businesses').doc(cred.user.uid).set(starterDb(biz, email)),
+        _fdb.collection('biz_index').doc(cred.user.uid).set({bizId:cred.user.uid, ownerUid:cred.user.uid, name:biz, createdAt:new Date().toISOString()})
       ]);
     } else {
       await _auth.signInWithEmailAndPassword(email, pass);
@@ -496,7 +725,7 @@ document.getElementById('logoutBtn').onclick = async () => {
   if (State.db && _auth.currentUser && _outUid)
     await _fdb.collection('businesses').doc(_outUid).set(State.db).catch(()=>{});
   await _auth.signOut();
-  State.user = null; State.db = null; State.isAdmin = false; State.bizUid = ''; State.isMember = false;
+  State.user = null; State.db = null; State.isAdmin = false; State.bizUid = ''; State.isMember = false; State.bizList = []; State.account = null; State.ownerPlan = null;
 };
 
 /* ============================================================
@@ -508,17 +737,25 @@ function refreshChrome(){
   document.getElementById('topLogo').innerHTML=s.logo?`<img src="${s.logo}" style="width:100%;height:100%;object-fit:cover;border-radius:7px">`:esc(s.businessName[0]||'B');
   const plan=s.plan||'free';
   const proAccess=plan==='pro'||plan==='trial';
-  const badge=plan==='pro'?'PRO':plan==='trial'?`TRIAL · ${State.trialDaysLeft}d`:'FREE';
+  const badge=plan==='pro'?((State.proDaysLeft!==null&&State.proDaysLeft!==undefined&&State.proDaysLeft<=7)?`PRO · ${State.proDaysLeft}d`:'PRO'):plan==='trial'?`TRIAL · ${State.trialDaysLeft}d`:'FREE';
   const badgeCls=plan==='pro'?'pro':plan==='trial'?'pro':'free';
   document.getElementById('topPlan').className='badge '+badgeCls;
   document.getElementById('topPlan').textContent=badge;
-  document.getElementById('planName').textContent=plan==='pro'?'Pro':plan==='trial'?`Trial (${State.trialDaysLeft} days left)`:'Free';
+  document.getElementById('planName').textContent=plan==='pro'?((State.ownerPlan&&State.ownerPlan.proUntil&&!State.isAdmin)?'Pro until '+fmtDate(State.ownerPlan.proUntil):'Pro'):plan==='trial'?`Trial (${State.trialDaysLeft} days left)`:'Free';
   document.getElementById('upgradeBtn').style.display=plan==='pro'?'none':'block';
   document.getElementById('upgradeBtn').textContent=plan==='trial'?'Upgrade to Pro':'Upgrade to Pro';
-  document.querySelectorAll('[data-feature-lock]').forEach(l=>{
-    const key=l.dataset.featureLock;
-    l.style.display=featureLocked(key)?'inline-block':'none';
+  document.querySelectorAll('#nav a[data-view]').forEach(a=>{
+    const key=VIEW_FEATURE_MAP[a.dataset.view]; if(!key) return;
+    const mode=moduleMode(key);
+    a.style.display=moduleOff(key)?'none':'';
+    let lk=a.querySelector('[data-feature-lock]');
+    if(!lk){ lk=document.createElement('span'); lk.className='lock'; lk.setAttribute('data-lock',''); lk.dataset.featureLock=key; a.appendChild(lk); }
+    const showOff=State.isAdmin&&mode==='off';
+    lk.textContent=showOff?'OFF':'PRO';
+    lk.style.display=(showOff||featureLocked(key))?'inline-block':'none';
   });
+  const chip=document.querySelector('.biz-chip');
+  if(chip&&!chip.dataset.bound){ chip.dataset.bound='1'; chip.style.cursor='pointer'; chip.title='Switch business'; chip.setAttribute('role','button'); chip.onclick=openBizSwitcher; chip.insertAdjacentHTML('beforeend','<span class="biz-caret">\u25BE</span>'); }
   var _tn=document.querySelector('#nav a[data-view="team"]'); if(_tn) _tn.style.display=State.isMember?'none':'';
   document.getElementById('adminGroup').style.display=State.isAdmin?'block':'none';
   document.getElementById('adminLink').style.display=State.isAdmin?'flex':'none';
@@ -528,10 +765,11 @@ document.getElementById('upgradeBtn').onclick=openUpgrade;
 /* ============================================================
    ROUTER
    ============================================================ */
-const VIEW_FEATURE_MAP={stock:'stock',deliveries:'deliveries',email:'email',team:'team',expenses:'expenses',zakat:'zakat',gst:'gst',orders:'orders'};
 const TITLES={dashboard:'Dashboard',items:'Products',stock:'Stock',customers:'Customers',pos:'Point of Sale',employees:'Employees',expenses:'Expenses',gst:'GST',zakat:'Zakat Calculator',quotations:'Quotations',invoices:'Invoices',deliveries:'Deliveries',orders:'Customer Orders',email:'Email',team:'Team Access',settings:'Settings',admin:'Portal Admin'};
 function go(view){
   if(view==='admin'&&!State.isAdmin){view='dashboard';}
+  if(VIEW_FEATURE_MAP[view]&&moduleOff(VIEW_FEATURE_MAP[view])){toast((TITLES[view]||view)+' is not available');view='dashboard';}
+  if(State.db) _applyPlan(false);
   State.view=view;
   document.querySelectorAll('#nav a').forEach(a=>a.classList.toggle('active',a.dataset.view===view));
   document.getElementById('pageTitle').textContent=TITLES[view]||view;
@@ -565,7 +803,7 @@ document.getElementById('navScrim').onclick=()=>toggleNav(false);
 function lockedView(view){
   return `<div class="locked-view"><div class="ic">${svg('lock',28)}</div>
    <h2 style="font-size:22px">${TITLES[view]} is a Pro feature</h2>
-   <p class="muted" style="margin:10px 0 20px">Upgrade to unlock delivery management, email sending &amp; receiving, recurring invoices, and reporting.</p>
+   <p class="muted" style="margin:10px 0 20px">${(State.ownerPlan&&State.ownerPlan.plan==='pro'&&State.ownerPlan.proUntil)?'The Pro subscription ended on '+fmtDate(State.ownerPlan.proUntil)+'. Renew to use it again.':'Upgrade to Pro to use this module.'}${State.isMember?' Ask the business owner to renew.':''}</p>
    <button class="btn amber" onclick="openUpgrade()">See Pro plans</button></div>`;
 }
 
@@ -1690,6 +1928,7 @@ function saveSettings(){
   // Keep the customer order link data (bank details, products) in sync
   var uid=_bizUid();
   if(uid){ syncPortal(uid); syncPosPortal(uid); }
+  _ensureBizIndex();
   refreshChrome();toast('Settings saved');
 }
 
@@ -3591,8 +3830,8 @@ async function viewTeam(){
   }
   c.innerHTML = '<div class="card pad muted" style="text-align:center">Loading team…</div>';
   try {
-    var snap = await _fdb.collection('invites').where('ownerUid', '==', _bizUid()).get();
-    _teamInvites = snap.docs.map(function(d){ return d.data(); })
+    var snap = await _fdb.collection('invites').where('ownerUid', '==', State.user.uid).get();
+    _teamInvites = snap.docs.map(function(d){ return d.data(); }).filter(function(i){ return (i.bizId || i.ownerUid) === _bizUid(); })
       .sort(function(a,b){ return (b.createdAt||'') > (a.createdAt||'') ? 1 : -1; });
   } catch(e) {
     c.innerHTML = '<div class="card pad" style="background:var(--amber-soft);border-color:var(--amber)"><b>Could not load your team.</b><br>' +
@@ -3660,7 +3899,7 @@ async function createInvite(){
   if (!email && !phone) return toast('Add a WhatsApp number or an email');
   if (email && !/^\S+@\S+\.\S+$/.test(email)) return toast('That email address looks wrong');
   if (email && _teamInvites.some(function(i){ return i.email === email; })) return toast('Already invited');
-  var inv = { code:_randCode(24), ownerUid:_bizUid(), ownerName:_inviteBizName(), name:name, email:email, phone:phone,
+  var inv = { code:_randCode(24), ownerUid:State.user.uid, bizId:_bizUid(), bizName:_inviteBizName(), ownerName:_inviteBizName(), name:name, email:email, phone:phone,
               role:role, status:'pending', createdAt:new Date().toISOString() };
   try { await _fdb.collection('invites').doc(inv.code).set(inv); }
   catch(e) { return toast('Could not save invitation: ' + e.message); }
@@ -3692,7 +3931,10 @@ function removeInvite(code){
   var inv = _teamInvites.find(function(i){ return i.code === code; }); if (!inv) return;
   confirmDel('Remove ' + inv.name + '?' + (inv.status === 'accepted' ? ' They will lose access immediately.' : ''), async function(){
     try {
-      if (inv.status === 'accepted' && inv.acceptedBy) await _fdb.collection('members').doc(inv.acceptedBy).delete();
+      if (inv.status === 'accepted' && inv.acceptedBy) {
+        await _fdb.collection('members').doc((inv.bizId || inv.ownerUid) + '_' + inv.acceptedBy).delete().catch(function(){});
+        if (!inv.bizId) await _fdb.collection('members').doc(inv.acceptedBy).delete().catch(function(){});   // older format
+      }
       await _fdb.collection('invites').doc(code).delete();
       _teamInvites = _teamInvites.filter(function(i){ return i.code !== code; });
       _renderTeam(); toast('Removed');
@@ -3737,84 +3979,183 @@ function resetPosToken(){confirmDel('Reset the POS link? All staff will need to 
 var _adminTab='users';
 function num(n){return Number(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
 var _adminUsers=[];
+/* ============================================================
+   PORTAL ADMIN — accounts, subscriptions, businesses
+   ============================================================ */
+var _adminFilter = 'all', _adminQuery = '', _adminBiz = [];
 async function viewAdmin(){
-  const c=document.getElementById('content');
-  c.innerHTML='<div class="card pad muted">Loading portal data…</div>';
-  try{
-    const snap = await _fdb.collection('plan_info').get();
-    _adminUsers = snap.docs.map(d=>{
-      const data=d.data();
-      return{userId:d.id, email:data.email||'', businessName:data.businessName||'',
-        plan:computePlan(data), expiry:data.trialExpiry||null, invoices:0, collected:0, quotes:0};
-    });
+  const c = document.getElementById('content');
+  c.innerHTML = '<div class="card pad muted">Loading portal data…</div>';
+  try {
+    const [snap, bsnap] = await Promise.all([
+      _fdb.collection('plan_info').get(),
+      _fdb.collection('biz_index').get().catch(function(){ return { docs:[] }; })
+    ]);
+    _adminBiz = bsnap.docs.map(function(d){ return Object.assign({ bizId:d.id }, d.data()); });
+    _adminUsers = snap.docs.map(function(d){
+      const pi = d.data(), st = planStatus(pi);
+      const biz = _adminBiz.filter(function(b){ return b.ownerUid === d.id; });
+      if (!biz.some(function(b){ return b.bizId === d.id; }) && pi.businessName) biz.unshift({ bizId:d.id, name:pi.businessName });
+      return { userId:d.id, pi:pi, email:pi.email || '', name:pi.businessName || (biz[0] && biz[0].name) || '',
+        status:st, created:_toDate(pi.createdAt), businesses:biz };
+    }).sort(function(a, b){ return (b.created || 0) - (a.created || 0); });
     renderAdminView();
-  }catch(e){
-    console.error('viewAdmin error',e);
-    const isPerm=e.code==='permission-denied'||e.message.includes('permission');
-    c.innerHTML='<div class="card pad" style="background:var(--amber-soft);border-color:var(--amber)">'+(isPerm
-      ?'<b>Firestore permission denied.</b><br>Go to <a href="https://console.firebase.google.com" target="_blank">Firebase Console</a> → Firestore Database → Rules and publish the security rules. Make sure <code>vaddever@gmail.com</code> is set as admin email in the rules.'
-      :'<b>Error loading admin data:</b><br>'+esc(e.message))+'<br><small style="color:var(--ink-soft)">Check browser console (F12) for full error details.</small></div>';
+  } catch(e) {
+    console.error('viewAdmin error', e);
+    const isPerm = e.code === 'permission-denied' || String(e.message).includes('permission');
+    c.innerHTML = '<div class="card pad" style="background:var(--amber-soft);border-color:var(--amber)">' + (isPerm
+      ? '<b>Firestore permission denied.</b><br>Publish the latest firestore.rules in Firebase Console → Firestore Database → Rules.'
+      : '<b>Error loading admin data:</b><br>' + esc(e.message)) + '</div>';
   }
 }
 function renderAdminView(){
-  const c=document.getElementById('content');
-  c.innerHTML=`<div class="admin-tabs">
-    <button class="admin-tab ${_adminTab==='users'?'active':''}" onclick="_adminTab='users';renderAdminView()">Users</button>
-    <button class="admin-tab ${_adminTab==='settings'?'active':''}" onclick="_adminTab='settings';renderAdminSettings()">Platform Settings</button>
-  </div>
-  <div id="adminPanel"></div>`;
-  if(_adminTab==='users') renderAdmin('');
-  else renderAdminSettings();
+  const c = document.getElementById('content');
+  c.innerHTML = '<div class="tabs">' +
+    '<button class="' + (_adminTab==='users'?'active':'') + '" onclick="_adminTab=\'users\';renderAdminView()">Accounts</button>' +
+    '<button class="' + (_adminTab==='settings'?'active':'') + '" onclick="_adminTab=\'settings\';renderAdminView()">Platform settings</button>' +
+  '</div><div id="adminPanel"></div>';
+  if (_adminTab === 'users') renderAdmin(_adminQuery); else renderAdminSettings();
 }
 function renderAdmin(q){
-  const all=_adminUsers;
-  const us=all.filter(u=>((u.businessName||'')+(u.email||'')).toLowerCase().includes(q.toLowerCase()));
-  const proCount=all.filter(u=>u.plan==='pro').length;
-  const totalInv=all.reduce((s,u)=>s+u.invoices,0);
-  const collected=all.reduce((s,u)=>s+u.collected,0);
-  const p=document.getElementById('adminPanel');if(!p)return;
-  p.innerHTML=`
-   <div class="grid kpis" style="margin-bottom:16px">
-     <div class="card kpi"><div class="lbl">Businesses</div><div class="val">${all.length}</div><div class="sub muted">tenants</div></div>
-     <div class="card kpi"><div class="lbl">Pro accounts</div><div class="val">${proCount}</div><div class="sub up">${all.length?Math.round(proCount/all.length*100):0}% Pro</div></div>
-     <div class="card kpi"><div class="lbl">Invoices</div><div class="val">${totalInv}</div><div class="sub muted">portal-wide</div></div>
-     <div class="card kpi"><div class="lbl">Collected</div><div class="val" style="font-size:20px">${num(collected)}</div><div class="sub muted">mixed currencies</div></div>
-   </div>
-   <div class="toolbar"><div class="search">${svg('search')}<input placeholder="Search businesses…" value="${esc(q)}" oninput="renderAdmin(this.value)"></div></div>
-   ${us.length?`<div class="tbl"><table><thead><tr><th>Business</th><th>Email</th><th>Plan</th><th>Expiry date</th><th class="right">Products</th><th class="right">Invoices</th><th class="right">Outstanding</th><th></th></tr></thead><tbody>
-     ${us.map(u=>`<tr>
-       <td style="font-weight:600">${esc(u.businessName||'—')}<div class="muted" style="font-size:11px">${u.created?fmtDate(u.created):''}</div></td>
-       <td class="muted">${esc(u.email)}</td>
-       <td><select class="pill ${u.plan==='pro'?'paid':'draft'}" style="border:none;font-weight:600;cursor:pointer" onchange="adminSetPlan('${u.userId}',this.value)">
-         <option value="free" ${u.plan!=='pro'?'selected':''}>free</option><option value="pro" ${u.plan==='pro'?'selected':''}>pro</option></select></td>
-       <td><input type="date" value="${u.expiry||''}" style="border:1px solid var(--line);border-radius:8px;padding:4px 8px;font-size:12px;background:var(--paper)" onchange="adminSetExpiry('${u.userId}',this.value)"></td>
-       <td class="right mono">${u.items??'—'}</td><td class="right mono">${u.invoices??'—'}</td>
-       <td class="right mono">${num(u.outstanding)}</td>
-       <td><div class="rowacts"><button class="iconbtn" onclick="adminDelete('${u.userId}')">${svg('trash')}</button></div></td>
-     </tr>`).join('')}
-   </tbody></table></div>`:emptyBox('No businesses found','No tenants match.')}
-  `;
+  _adminQuery = q || '';
+  const all = _adminUsers, p = document.getElementById('adminPanel'); if (!p) return;
+  const count = function(k){ return all.filter(function(u){ return u.status.key === k; }).length; };
+  const expSoon = all.filter(function(u){ return u.status.key === 'pro' && u.status.days !== undefined && u.status.days !== null && u.status.days <= 7; }).length;
+  const filters = [['all','All',all.length],['pro','Pro',count('pro')],['trial','Trial',count('trial')],['expired','Expired',count('expired')],['free','Free',count('free')],['suspended','Suspended',count('suspended')]];
+  const ql = _adminQuery.toLowerCase();
+  const list = all.filter(function(u){
+    if (_adminFilter !== 'all' && u.status.key !== _adminFilter) return false;
+    return !ql || (u.name + ' ' + u.email + ' ' + u.businesses.map(function(b){ return b.name; }).join(' ')).toLowerCase().includes(ql);
+  });
+  const pill = function(st){ const cls = { pro:'paid', trial:'sent', expired:'overdue', free:'draft', suspended:'overdue' }[st.key] || 'draft';
+    return '<span class="pill ' + cls + '">' + st.label + '</span>' + (st.detail ? '<div class="muted" style="font-size:11.5px;margin-top:3px">' + esc(st.detail) + '</div>' : ''); };
+  p.innerHTML =
+    '<div class="grid kpis" style="margin:14px 0 16px">' +
+      '<div class="card kpi"><div class="lbl">Accounts</div><div class="val">' + all.length + '</div><div class="sub muted">' + _adminBiz.length + ' businesses</div></div>' +
+      '<div class="card kpi"><div class="lbl">Active Pro</div><div class="val">' + count('pro') + '</div><div class="sub ' + (expSoon ? 'down' : 'muted') + '">' + expSoon + ' ending within 7 days</div></div>' +
+      '<div class="card kpi"><div class="lbl">On trial</div><div class="val">' + count('trial') + '</div><div class="sub muted">free trial</div></div>' +
+      '<div class="card kpi"><div class="lbl">Expired</div><div class="val">' + count('expired') + '</div><div class="sub muted">Pro features stopped</div></div>' +
+    '</div>' +
+    '<div class="tabs" style="margin-bottom:10px">' + filters.map(function(f){
+      return '<button class="' + (_adminFilter===f[0]?'active':'') + '" onclick="_adminFilter=\'' + f[0] + '\';renderAdmin(_adminQuery)">' + f[1] + ' (' + f[2] + ')</button>'; }).join('') + '</div>' +
+    '<div class="toolbar"><div class="search">' + svg('search') + '<input id="adminSearch" placeholder="Search accounts or businesses…" value="' + esc(_adminQuery) + '" oninput="renderAdmin(this.value);var i=document.getElementById(\'adminSearch\');i.focus();i.setSelectionRange(i.value.length,i.value.length)"></div></div>' +
+    (list.length
+      ? '<div class="tbl"><table><thead><tr><th>Account</th><th>Businesses</th><th>Plan</th><th>Joined</th><th></th></tr></thead><tbody>' +
+        list.map(function(u){
+          return '<tr><td><b>' + esc(u.name || '—') + '</b><div class="muted" style="font-size:12px">' + esc(u.email) + '</div></td>' +
+            '<td>' + (u.businesses.length ? u.businesses.map(function(b){ return esc(b.name); }).join('<br>') : '<span class="muted">—</span>') + '</td>' +
+            '<td>' + pill(u.status) + '</td>' +
+            '<td class="muted">' + (u.created ? fmtDate(_localISO(u.created)) : '—') + '</td>' +
+            '<td><div class="rowacts"><button class="btn ghost tiny" onclick="adminManage(\'' + u.userId + '\')">Manage</button></div></td></tr>';
+        }).join('') + '</tbody></table></div>'
+      : emptyBox('No accounts found', 'Try another filter or search.'));
   renderIcons(p);
 }
-async function adminSetPlan(userId,plan){
-  const r={ok:true};await _fdb.collection('plan_info').doc(userId).set({plan},{merge:true}).catch(e=>{r.ok=false;r.error=e.message;});
-  if(!r.ok)return toast(r.error||'Failed');
-  const u=_adminUsers.find(x=>x.userId===userId);if(u)u.plan=plan;
-  toast('Plan set to '+plan);
+
+/* ---------- Manage one account ---------- */
+function _addMonths(iso, months){ const d = new Date(iso + 'T12:00:00'); const day = d.getDate(); d.setMonth(d.getMonth() + months); if (d.getDate() < day) d.setDate(0); return _localISO(d); }
+function _dayBefore(iso){ const d = new Date(iso + 'T12:00:00'); d.setDate(d.getDate() - 1); return _localISO(d); }
+function adminManage(userId){
+  const u = _adminUsers.find(function(x){ return x.userId === userId; }); if (!u) return;
+  const pi = u.pi, st = planStatus(pi), cfg = _platformCfg || {};
+  const subs = (pi.subscriptions || []).slice().sort(function(a, b){ return String(b.addedAt).localeCompare(String(a.addedAt)); });
+  const trial = _toDate(pi.trialExpiry);
+  const fromISO = _proActive(pi) && pi.proUntil ? pi.proUntil : _localISO();
+  openModal(esc(u.name || u.email),
+    '<div class="muted" style="font-size:12.5px;margin:-4px 0 12px">' + esc(u.email) + (u.created ? ' · joined ' + fmtDate(_localISO(u.created)) : '') + '</div>' +
+    '<div class="card" style="padding:12px 14px;margin-bottom:12px;background:var(--paper)">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><b>Subscription</b>' +
+      '<span class="pill ' + ({pro:'paid',trial:'sent',expired:'overdue',suspended:'overdue'}[st.key] || 'draft') + '">' + st.label + (st.detail ? ' · ' + esc(st.detail) : '') + '</span></div>' +
+      '<div class="fgrid" style="margin-top:10px">' +
+        '<div class="field"><label>Add period</label><select id="sub_months" onchange="adminSubPreview(\'' + fromISO + '\')">' +
+          '<option value="1">1 month</option><option value="3">3 months</option><option value="6">6 months</option><option value="12" selected>12 months</option><option value="0">Custom end date…</option></select></div>' +
+        '<div class="field"><label>Pro until</label><input id="sub_until" type="date" value="' + _addMonths(fromISO, 12) + '"></div>' +
+        '<div class="field"><label>Amount paid (' + esc(cfg.currency || 'Rf') + ')</label><input id="sub_amount" type="number" step="0.01" value="' + ((+cfg.proPrice || 299) * 12) + '"></div>' +
+        '<div class="field"><label>Payment reference</label><input id="sub_ref" placeholder="e.g. BML transfer 12345"></div>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+        '<button class="btn accent sm" onclick="adminAddSubscription(\'' + userId + '\')">Save subscription</button>' +
+        (_proActive(pi) ? '<button class="btn ghost sm" style="color:var(--danger)" onclick="adminEndSubscription(\'' + userId + '\')">End Pro now</button>' : '') +
+      '</div>' +
+      (subs.length ? '<div style="margin-top:12px;font-size:12.5px"><b>History</b>' + subs.map(function(s){
+        return '<div style="display:flex;justify-content:space-between;gap:8px;border-top:1px dashed var(--line);padding:6px 0">' +
+          '<span>' + (s.type === 'cancel' ? 'Ended early' : esc(fmtDate(s.start)) + ' → ' + esc(fmtDate(s.end))) + (s.ref ? '<br><span class="muted">' + esc(s.ref) + '</span>' : '') + '</span>' +
+          '<span class="mono" style="white-space:nowrap">' + (s.amount ? num(s.amount) : '') + '</span></div>'; }).join('') + '</div>' : '') +
+    '</div>' +
+    '<div class="card" style="padding:12px 14px;margin-bottom:12px;background:var(--paper)">' +
+      '<b>Free trial</b><div style="display:flex;gap:8px;align-items:flex-end;margin-top:8px;flex-wrap:wrap">' +
+        '<div class="field" style="margin:0;flex:1;min-width:150px"><label>Trial ends</label><input id="trial_until" type="date" value="' + (trial ? _localISO(trial) : '') + '"></div>' +
+        '<button class="btn ghost sm" onclick="adminSetTrial(\'' + userId + '\')">Save trial date</button></div>' +
+    '</div>' +
+    '<div class="card" style="padding:12px 14px;margin-bottom:6px;background:var(--paper)">' +
+      '<b>Businesses</b>' + (u.businesses.length ? u.businesses.map(function(b){ return '<div style="font-size:13px;padding:5px 0;border-top:1px dashed var(--line)">' + esc(b.name) + ' <span class="muted mono" style="font-size:11px">' + esc(b.bizId) + '</span></div>'; }).join('') : '<div class="muted" style="font-size:13px">None registered yet.</div>') +
+    '</div>' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' +
+      '<button class="btn ghost sm" onclick="adminResetPassword(\'' + userId + '\')">Send password reset email</button>' +
+      '<button class="btn ghost sm" onclick="adminToggleSuspend(\'' + userId + '\')">' + (pi.suspended ? 'Reactivate account' : 'Suspend account') + '</button>' +
+      '<button class="btn ghost sm" style="color:var(--danger)" onclick="adminDelete(\'' + userId + '\')">Delete account data</button>' +
+    '</div>',
+    [{label:'Close', cls:'ghost', fn:closeModal}], 'lg');
 }
-async function adminSetExpiry(userId,date){
-  const r={ok:true};await _fdb.collection('plan_info').doc(userId).set({trialExpiry:new Date(date)},{merge:true}).catch(e=>{r.ok=false;r.error=e.message;});
-  if(!r.ok)return toast(r.error||'Failed');
-  const u=_adminUsers.find(x=>x.userId===userId);if(u)u.expiry=date;
-  toast('Expiry updated');
+function adminSubPreview(fromISO){
+  const m = +val('sub_months'); if (!m) return;
+  const until = document.getElementById('sub_until'); if (until) until.value = _addMonths(fromISO, m);
+  const amt = document.getElementById('sub_amount'); if (amt) amt.value = (+(_platformCfg||{}).proPrice || 299) * m;
+}
+async function _adminWrite(userId, data, msg){
+  try { await _fdb.collection('plan_info').doc(userId).set(data, { merge:true }); }
+  catch(e) { toast('Could not save: ' + e.message); return false; }
+  const u = _adminUsers.find(function(x){ return x.userId === userId; });
+  if (u) { Object.keys(data).forEach(function(k){ if (k !== 'subscriptions') u.pi[k] = data[k]; }); u.status = planStatus(u.pi); }
+  toast(msg); return true;
+}
+async function adminAddSubscription(userId){
+  const u = _adminUsers.find(function(x){ return x.userId === userId; }); if (!u) return;
+  const until = val('sub_until'); if (!until) return toast('Choose the “Pro until” date');
+  if (until < _localISO()) return toast('That date is in the past');
+  const rec = { id:_randCode(10), type:'subscription', start:(_proActive(u.pi) && u.pi.proUntil ? u.pi.proUntil : _localISO()), end:until,
+    months:+val('sub_months') || 0, amount:+val('sub_amount') || 0, ref:val('sub_ref').trim(), addedAt:new Date().toISOString(), by:State.user.email };
+  const subs = (u.pi.subscriptions || []).concat([rec]);
+  if (await _adminWrite(userId, { plan:'pro', proUntil:until, subscriptions:subs }, 'Pro active until ' + fmtDate(until))) { u.pi.subscriptions = subs; adminManage(userId); renderAdmin(_adminQuery); }
+}
+function adminEndSubscription(userId){
+  const u = _adminUsers.find(function(x){ return x.userId === userId; }); if (!u) return;
+  confirmDel('End Pro for ' + esc(u.name || u.email) + ' now? Pro features stop immediately for all their businesses.', async function(){
+    const rec = { id:_randCode(10), type:'cancel', start:_localISO(), end:_localISO(), amount:0, ref:'', addedAt:new Date().toISOString(), by:State.user.email };
+    const subs = (u.pi.subscriptions || []).concat([rec]);
+    if (await _adminWrite(userId, { plan:'free', proUntil:_dayBefore(_localISO()), subscriptions:subs }, 'Pro ended')) { u.pi.subscriptions = subs; adminManage(userId); renderAdmin(_adminQuery); }
+  });
+}
+async function adminSetTrial(userId){
+  const d = val('trial_until'); if (!d) return toast('Choose a date');
+  if (await _adminWrite(userId, { trialExpiry:new Date(d + 'T23:59:59') }, 'Trial ends ' + fmtDate(d))) { adminManage(userId); renderAdmin(_adminQuery); }
+}
+function adminToggleSuspend(userId){
+  const u = _adminUsers.find(function(x){ return x.userId === userId; }); if (!u) return;
+  if (u.email.toLowerCase() === ADMIN_EMAIL.toLowerCase()) return toast('You cannot suspend the platform admin account');
+  const s = !u.pi.suspended;
+  confirmDel((s ? 'Suspend ' : 'Reactivate ') + esc(u.name || u.email) + '?' + (s ? ' They (and their team) will be signed out and cannot open their businesses.' : ''), async function(){
+    if (await _adminWrite(userId, { suspended:s }, s ? 'Account suspended' : 'Account reactivated')) { adminManage(userId); renderAdmin(_adminQuery); }
+  });
+}
+async function adminResetPassword(userId){
+  const u = _adminUsers.find(function(x){ return x.userId === userId; }); if (!u || !u.email) return toast('No email on this account');
+  try { await _auth.sendPasswordResetEmail(u.email); toast('Password reset email sent to ' + u.email); }
+  catch(e) { toast('Could not send: ' + e.message); }
 }
 function adminDelete(userId){
-  const u=_adminUsers.find(x=>x.userId===userId);
-  confirmDel('Delete "'+esc(u?u.businessName||u.email:'this business')+'" and all data? This cannot be undone.',async()=>{
-    const r={ok:true};await Promise.all([_fdb.collection('businesses').doc(userId).delete(),_fdb.collection('plan_info').doc(userId).delete()]).catch(e=>{r.ok=false;r.error=e.message;});
-    if(!r.ok)return toast(r.error||'Failed');
-    _adminUsers=_adminUsers.filter(x=>x.userId!==userId);
-    renderAdmin('');toast('Business deleted');
+  const u = _adminUsers.find(function(x){ return x.userId === userId; }); if (!u) return;
+  if (u.email.toLowerCase() === ADMIN_EMAIL.toLowerCase()) return toast('You cannot delete the platform admin account');
+  confirmDel('Delete all data for ' + esc(u.name || u.email) + ' — ' + u.businesses.length + ' business(es), their subscription and settings? This cannot be undone.<br><br><span class="muted" style="font-size:12.5px">Their login itself stays; remove it in Firebase Console → Authentication if needed.</span>', async function(){
+    try {
+      for (const b of u.businesses) {
+        await _fdb.collection('businesses').doc(b.bizId).delete().catch(function(){});
+        await _fdb.collection('biz_index').doc(b.bizId).delete().catch(function(){});
+      }
+      await _fdb.collection('plan_info').doc(userId).delete();
+    } catch(e) { return toast('Could not delete: ' + e.message); }
+    _adminUsers = _adminUsers.filter(function(x){ return x.userId !== userId; });
+    closeModal(); renderAdmin(_adminQuery); toast('Account data deleted');
   });
 }
 
@@ -3867,8 +4208,8 @@ async function renderAdminSettings(){
           <select id="cfg_rem" style="border:1px solid var(--line);border-radius:8px;padding:6px 10px"><option value="1" ${c.reminderEnabled?'selected':''}>On</option><option value="0" ${!c.reminderEnabled?'selected':''}>Off</option></select></div>
         <div class="field" style="margin-top:8px"><label>Remind at (days before expiry, comma-separated)</label><input id="cfg_remdays" value="${esc((c.reminderDays||[7,3,1]).join(','))}"></div>
       </div>
-      <div class="cfg-section"><h4>Pro Feature Configuration</h4>
-        <p class="muted" style="font-size:12.5px;margin-bottom:10px">Choose which features require a Pro plan. Toggle any feature to "Free" to make it available to everyone, including free-tier users.</p>
+      <div class="cfg-section"><h4>Modules &amp; Pro features</h4>
+        <p class="muted" style="font-size:12.5px;margin-bottom:10px">For each module choose: <b>Free for all</b>, <b>Pro only</b> (needs an active subscription), or <b>Turned off</b> (hidden from all users). Changes apply the next time users open the portal.</p>
         <div id="featToggleList" style="display:flex;flex-direction:column;gap:8px"></div>
       </div>
     </div>
@@ -3893,40 +4234,37 @@ async function renderAdminSettings(){
    </div>`;
   renderFeatureToggles();
 }
-const FEATURE_TOGGLE_DEFS=[
-  {key:'stock',       label:'Stock management & reorder alerts'},
-  {key:'multiEmployee',label:'Unlimited employees (beyond free limit)'},
-  {key:'expenses',    label:'Expense tracking'},
-  {key:'gst',        label:'GST tracking & returns (MIRA 205)'},
-  {key:'orders',      label:'Customer order portal'},
-  {key:'zakat',       label:'Zakat calculator'},
-  {key:'deliveries',  label:'Delivery notes'},
-  {key:'email',       label:'Send documents by email & WhatsApp'},
-  {key:'team',        label:'Team / multi-user portal access'}
-];
+/* Platform settings → Modules: Free for all / Pro only / Off */
+const FEATURE_TOGGLE_DEFS = MODULE_DEFS;   // older name
 function renderFeatureToggles(){
-  const host=document.getElementById('featToggleList');
-  if(!host)return;
-  const pf=Object.assign({},DEFAULT_PRO_FEATURES,_adminCfg.proFeatures||{});
-  host.innerHTML=FEATURE_TOGGLE_DEFS.map(f=>`
-    <div class="toggle-row" style="border:1px solid var(--line);border-radius:10px;padding:8px 12px">
-      <div style="font-weight:500;font-size:13.5px">${esc(f.label)}</div>
-      <select id="feat_${f.key}" style="border:1px solid var(--line);border-radius:8px;padding:6px 10px;flex-shrink:0">
-        <option value="1" ${pf[f.key]?'selected':''}>Pro only</option>
-        <option value="0" ${!pf[f.key]?'selected':''}>Free for all</option>
-      </select>
-    </div>`).join('');
+  const host = document.getElementById('featToggleList'); if (!host) return;
+  const saved = _platformCfg; _platformCfg = _adminCfg || {};          // read the settings being edited
+  const modes = moduleModes(); _platformCfg = saved;
+  host.innerHTML = MODULE_DEFS.map(function(m){
+    const mode = modes[m.key];
+    return '<div class="toggle-row" style="border:1px solid var(--line);border-radius:10px;padding:8px 12px;gap:10px">' +
+      '<div style="font-weight:500;font-size:13.5px;min-width:0">' + esc(m.label) + (m.feature ? '<div class="muted" style="font-size:11.5px">feature</div>' : '') + '</div>' +
+      '<select id="feat_' + m.key + '" style="border:1px solid var(--line);border-radius:8px;padding:6px 10px;flex-shrink:0">' +
+        '<option value="free"' + (mode==='free'?' selected':'') + '>Free for all</option>' +
+        '<option value="pro"'  + (mode==='pro' ?' selected':'') + '>Pro only</option>' +
+        (m.feature ? '' : '<option value="off"' + (mode==='off'?' selected':'') + '>Turned off</option>') +
+      '</select></div>';
+  }).join('');
+}
+function _collectModuleModes(){
+  const modules = {}, proFeatures = {};
+  MODULE_DEFS.forEach(function(m){ const v = val('feat_' + m.key) || m.def; modules[m.key] = v; proFeatures[m.key] = v === 'pro'; });
+  return { modules:modules, proFeatures:proFeatures };
 }
 async function saveAdminSettings(){
-  const proFeatures={};
-  FEATURE_TOGGLE_DEFS.forEach(f=>{ proFeatures[f.key]=val('feat_'+f.key)==='1'; });
+  const _mm=_collectModuleModes(); const proFeatures=_mm.proFeatures;
   const cfg={
     proPrice:+val('cfg_price')||299, currency:val('cfg_sym')||'Rf',
     proAnnualPrice:+val('cfg_aprx')||0, annualLabel:val('cfg_albl'),
     trialEnabled:val('cfg_trial')==='1', trialDays:+val('cfg_tdays')||14, trialRequiresCard:val('cfg_tcard')==='1',
     reminderEnabled:val('cfg_rem')==='1', reminderDays:(val('cfg_remdays')||'7,3,1').split(',').map(n=>+n.trim()).filter(Boolean),
     maxFreeEmployees:+val('cfg_maxemp')||5, maxFreeProducts:+val('cfg_maxprod')||0,
-    proFeatures,
+    proFeatures, modules:_mm.modules,
     announcement:val('cfg_ann'), announcementType:val('cfg_anntype'),
     registrationClosed:val('cfg_reg')==='0'
   };

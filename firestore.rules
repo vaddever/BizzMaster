@@ -4,64 +4,84 @@ service cloud.firestore {
 
     /* ---------- helpers ---------- */
     function signedIn() { return request.auth != null; }
-    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
-    // A team member: members/{theirUid} points at the business owner's uid
-    function isTeam(uid) {
-      return signedIn()
-        && exists(/databases/$(database)/documents/members/$(request.auth.uid))
-        && get(/databases/$(database)/documents/members/$(request.auth.uid)).data.ownerUid == uid;
-    }
     function isPlatformAdmin() { return signedIn() && request.auth.token.email == "vaddever@gmail.com"; }
+    // Owner: an account's first business uses the account uid as its id;
+    // further businesses are registered in biz_index/{bizId} with ownerUid.
+    function ownsBiz(bizId) {
+      return signedIn() && (request.auth.uid == bizId
+        || (exists(/databases/$(database)/documents/biz_index/$(bizId))
+            && get(/databases/$(database)/documents/biz_index/$(bizId)).data.ownerUid == request.auth.uid));
+    }
+    // Team member: members/{bizId}_{memberUid}  (older format: members/{memberUid} with ownerUid)
+    function isTeam(bizId) {
+      return signedIn() && (
+        exists(/databases/$(database)/documents/members/$(bizId + '_' + request.auth.uid))
+        || (exists(/databases/$(database)/documents/members/$(request.auth.uid))
+            && get(/databases/$(database)/documents/members/$(request.auth.uid)).data.ownerUid == bizId));
+    }
+    function canUseBiz(bizId) { return ownsBiz(bizId) || isTeam(bizId); }
+    function inviteAllows(code, bizId, ownerUid) {
+      let inv = get(/databases/$(database)/documents/invites/$(code)).data;
+      return inv.status == 'pending'
+        && inv.get('bizId', inv.ownerUid) == bizId
+        && inv.ownerUid == ownerUid
+        && (inv.email == '' || inv.email == request.auth.token.email.lower());
+    }
 
-    /* ---------- business data: owner + team members only ---------- */
-    match /businesses/{uid} {
-      allow read, write: if isOwner(uid) || isTeam(uid);
+    /* ---------- business data: owner + team members ---------- */
+    match /businesses/{bizId} {
+      allow read, update: if canUseBiz(bizId);
+      allow create: if ownsBiz(bizId);
+      allow delete: if ownsBiz(bizId) || isPlatformAdmin();
 
       // Customer orders: the business manages them; customers (not signed in) place and track them
       match /customerOrders/{orderId} {
-        allow read, write: if isOwner(uid) || isTeam(uid);
+        allow read, write: if canUseBiz(bizId);
         allow create: if request.auth == null;
         allow read:   if request.auth == null;
         allow update: if request.auth == null;
       }
-
-      // Sales made on the staff POS link. Staff devices can only ADD a sale, and only
-      // if they hold the business's secret POS token. The business reads, imports, then deletes them.
+      // Sales from the staff POS link: staff devices can only ADD a sale, and only with the secret POS token
       match /posQueue/{saleId} {
-        allow read, delete: if isOwner(uid) || isTeam(uid);
+        allow read, delete: if canUseBiz(bizId);
         allow create: if request.resource.data.keys().hasOnly(['posToken', 'txn', 'createdAt'])
           && request.resource.data.posToken is string
           && exists(/databases/$(database)/documents/pos_portals/$(request.resource.data.posToken))
-          && get(/databases/$(database)/documents/pos_portals/$(request.resource.data.posToken)).data.businessUid == uid;
+          && get(/databases/$(database)/documents/pos_portals/$(request.resource.data.posToken)).data.businessUid == bizId;
       }
     }
 
-    /* ---------- public copies (readable only by someone who knows the secret token; no listing) ---------- */
-    // Customer order page: products, logo, bank details
+    /* ---------- business registry (which account owns which business) ---------- */
+    match /biz_index/{bizId} {
+      allow read: if signedIn() && (resource.data.ownerUid == request.auth.uid || isPlatformAdmin() || isTeam(bizId));
+      // can only register an id that is your account id, or a business that does not exist yet
+      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid
+        && (bizId == request.auth.uid || !exists(/databases/$(database)/documents/businesses/$(bizId)));
+      allow update: if signedIn() && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == request.auth.uid;
+      allow delete: if signedIn() && (resource.data.ownerUid == request.auth.uid || isPlatformAdmin());
+    }
+
+    /* ---------- public copies (readable only with the secret token; no listing) ---------- */
     match /portals/{token} {
       allow get: if true;
-      allow create: if signedIn() && (isOwner(request.resource.data.businessUid) || isTeam(request.resource.data.businessUid));
-      allow update: if signedIn()
-        && request.resource.data.businessUid == resource.data.businessUid
-        && (isOwner(resource.data.businessUid) || isTeam(resource.data.businessUid));
-      allow delete: if signedIn() && (isOwner(resource.data.businessUid) || isTeam(resource.data.businessUid));
+      allow create: if canUseBiz(request.resource.data.businessUid);
+      allow update: if request.resource.data.businessUid == resource.data.businessUid && canUseBiz(resource.data.businessUid);
+      allow delete: if canUseBiz(resource.data.businessUid);
     }
-    // Staff POS link: items, staff names and hashed PINs
     match /pos_portals/{token} {
       allow get: if true;
-      allow create: if signedIn() && (isOwner(request.resource.data.businessUid) || isTeam(request.resource.data.businessUid));
-      allow update: if signedIn()
-        && request.resource.data.businessUid == resource.data.businessUid
-        && (isOwner(resource.data.businessUid) || isTeam(resource.data.businessUid));
-      allow delete: if signedIn() && (isOwner(resource.data.businessUid) || isTeam(resource.data.businessUid));
+      allow create: if canUseBiz(request.resource.data.businessUid);
+      allow update: if request.resource.data.businessUid == resource.data.businessUid && canUseBiz(resource.data.businessUid);
+      allow delete: if canUseBiz(resource.data.businessUid);
     }
 
     /* ---------- team invitations ---------- */
-    // The invite code is the secret, so anyone holding the link can read that one invite.
     match /invites/{code} {
       allow get: if true;
       allow list: if signedIn() && resource.data.ownerUid == request.auth.uid;
-      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
+      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid
+        && ownsBiz(request.resource.data.get('bizId', request.auth.uid));
       allow update: if signedIn() && (
         resource.data.ownerUid == request.auth.uid
         || ( resource.data.status == 'pending'
@@ -70,25 +90,26 @@ service cloud.firestore {
              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedBy', 'acceptedAt']) ) );
       allow delete: if signedIn() && resource.data.ownerUid == request.auth.uid;
     }
-    // members/{theirUid}: links a signed-in person to the owner's business. Created only from a valid, unused invite.
-    match /members/{memberUid} {
-      allow get: if signedIn() && (request.auth.uid == memberUid || resource.data.ownerUid == request.auth.uid);
-      allow list: if signedIn() && resource.data.ownerUid == request.auth.uid;
-      allow create: if signedIn() && request.auth.uid == memberUid
-        && exists(/databases/$(database)/documents/invites/$(request.resource.data.code))
-        && get(/databases/$(database)/documents/invites/$(request.resource.data.code)).data.status == 'pending'
-        && get(/databases/$(database)/documents/invites/$(request.resource.data.code)).data.ownerUid == request.resource.data.ownerUid
-        && ( get(/databases/$(database)/documents/invites/$(request.resource.data.code)).data.email == ''
-             || get(/databases/$(database)/documents/invites/$(request.resource.data.code)).data.email == request.auth.token.email.lower() );
-      allow delete: if signedIn() && (resource.data.ownerUid == request.auth.uid || request.auth.uid == memberUid);
+    match /members/{mid} {
+      allow get: if signedIn() && (resource == null || resource.data.get('memberUid', mid) == request.auth.uid || resource.data.ownerUid == request.auth.uid);
+      allow list: if signedIn() && (resource.data.memberUid == request.auth.uid || resource.data.ownerUid == request.auth.uid);
+      // created only from a valid, unused invite for that exact business
+      allow create: if signedIn()
+        && request.resource.data.memberUid == request.auth.uid
+        && mid == request.resource.data.bizId + '_' + request.auth.uid
+        && inviteAllows(request.resource.data.code, request.resource.data.bizId, request.resource.data.ownerUid);
+      allow delete: if signedIn() && (resource.data.ownerUid == request.auth.uid || resource.data.get('memberUid', mid) == request.auth.uid);
     }
 
-    /* ---------- plan / subscription info ---------- */
+    /* ---------- accounts / subscriptions (plan_info/{accountUid}) ---------- */
     match /plan_info/{uid} {
-      allow read: if isOwner(uid) || isTeam(uid) || isPlatformAdmin();
-      // Owners can only create their own record as a free plan; only the platform admin can change plans
-      allow create: if (isOwner(uid) && request.resource.data.plan == 'free') || isPlatformAdmin();
-      allow update, delete: if isPlatformAdmin();
+      allow get: if signedIn();                 // team members need the owner's plan
+      allow list: if isPlatformAdmin();
+      // an account may only create its own record, as a free plan with no subscription / suspension fields
+      allow create: if isPlatformAdmin() || (signedIn() && request.auth.uid == uid
+        && request.resource.data.plan == 'free'
+        && !request.resource.data.keys().hasAny(['proUntil', 'subscriptions', 'suspended']));
+      allow update, delete: if isPlatformAdmin();   // only the platform admin changes plans
     }
 
     /* ---------- platform-wide settings ---------- */
