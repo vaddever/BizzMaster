@@ -128,28 +128,6 @@ function _sha256(ascii){
 }
 function _sha256hex(str){ return _sha256(unescape(encodeURIComponent(String(str)))); }
 
-/* ---------- Staff POS: publish register data (items, staff names, hashed PINs) to pos_portals/{posToken} ---------- */
-function syncPosPortal(uid){
-  const db = State.db, s = db && db.settings;
-  if (!s || !s.posToken || !uid) return;
-  const tok = s.posToken;
-  const data = {
-    businessUid: uid,
-    businessName: s.businessName || '', logo: s.logo || '',
-    currencySymbol: s.currencySymbol || 'Rf', taxLabel: s.taxLabel || 'GST', taxRate: +s.taxRate || 0,
-    posPrefix: s.posPrefix || 'TXN-', updatedAt: new Date().toISOString(),
-    employees: (db.employees||[]).filter(function(e){ return e && e.active!==false; }).map(function(e){
-      return { id:e.id, name:e.name||'', role:e.role||'cashier', pinHash: e.pin ? _sha256hex(tok+':'+e.id+':'+e.pin) : '' };
-    }),
-    items: (db.items||[]).filter(function(i){ return i && i.name; }).map(function(i){
-      return { id:i.id, name:i.name, sku:i.sku||'', barcode:i.barcode||'', unit:i.unit||'pc',
-        unitPrice:+i.unitPrice||0, taxable:i.taxable!==false, trackStock:i.trackStock!==false,
-        stockQty:i.stockQty||0, reorderLevel:i.reorderLevel||0 };
-    })
-  };
-  _fdb.collection('pos_portals').doc(tok).set(data).catch(function(e){ console.warn('POS portal sync:', e.message); });
-}
-
 /* ---------- Staff POS sales arrive in businesses/{uid}/posQueue; import them into the books + deduct stock ---------- */
 var _posUnsub = null;
 function startPosQueueListener(){
@@ -165,27 +143,32 @@ function stopPosQueueListener(){ if (_posUnsub) { try{ _posUnsub(); }catch(e){} 
 function importPosSales(docs){
   if (!State.db) return;
   if (!Array.isArray(State.db.transactions)) State.db.transactions = [];
-  var added = 0, refs = [];
+  var added = 0, saleRefs = [], clocks = [], clockRefs = [];
   docs.forEach(function(d){
-    var q = d.data(), t = q && q.txn;
-    refs.push(d.ref);
+    var q = d.data() || {};
+    if (q.clock) { clocks.push(q.clock); clockRefs.push(d.ref); return; }
+    var t = q.txn; saleRefs.push(d.ref);
     if (!t || !t.id) return;
     if (State.db.transactions.some(function(x){ return x.id === t.id; })) return;   // already imported
     if (t.totals && t.totals.subtotal === undefined && t.totals.sub !== undefined) t.totals.subtotal = t.totals.sub;
     t.source = 'staff-pos';
+    if (!t.shopId || !_shopById(t.shopId)) t.shopId = _mainShopId();
     State.db.transactions.unshift(t);
     (t.lineItems||[]).forEach(function(ci){
       var item = State.db.items.find(function(i){ return i.id === ci.itemId; });
-      if (item && item.trackStock !== false) addStockMovement(ci.itemId, 'sale', -ci.qty, 'POS-'+t.number, 'Staff POS');
+      if (item && item.trackStock !== false) addStockMovement(ci.itemId, 'sale', -ci.qty, 'POS-'+t.number, 'Staff POS', t.shopId);
     });
     added++;
   });
-  // Only remove the queue entries once the imported data is safely saved
-  _afterSave.push(function(){ refs.forEach(function(r){ r.delete().catch(function(){}); }); });
-  persist();
+  if (saleRefs.length) {
+    _afterSave.push(function(){ saleRefs.forEach(function(r){ r.delete().catch(function(){}); }); });
+    persist();
+  }
+  if (clocks.length) _applyClocks(clocks).then(function(){ clockRefs.forEach(function(r){ r.delete().catch(function(){}); }); if (State.view === 'employees' && _empTab === 'attendance') renderAttendance(); })
+    .catch(function(e){ console.warn('clock import:', e.message); });
   if (added) {
     toast(added + ' staff POS sale' + (added>1?'s':'') + ' imported');
-    if (['dashboard','stock','items'].indexOf(State.view) >= 0) go(State.view);
+    if (['dashboard','stock','items','shops'].indexOf(State.view) >= 0) go(State.view);
   }
 }
 
@@ -338,6 +321,7 @@ function _resetModuleState(){
   try { _customerOrders = []; _ordersFilter = 'all'; } catch(e) {}
   try { _teamInvites = []; } catch(e) {}
   try { editing = null; } catch(e) {}
+  try { _hr = null; _att = {}; _payRun = null; } catch(e) {}
   State.view = 'dashboard';
 }
 
@@ -553,7 +537,10 @@ const MODULE_DEFS = [
   { key:'email',      view:'email',      label:'Send documents by email & WhatsApp', def:'pro' },
   { key:'team',       view:'team',       label:'Team access (invite staff logins)', def:'pro' },
   { key:'multiEmployee', label:'Unlimited POS employees (beyond free limit)', def:'free', feature:true },
-  { key:'multiBusiness', label:'Several businesses in one account',          def:'pro',  feature:true }
+  { key:'multiBusiness', label:'Several businesses in one account',          def:'pro',  feature:true },
+  { key:'multiShop',     label:'Open more than one shop',                    def:'pro',  feature:true },
+  { key:'attendance',    label:'Staff attendance & clock in/out',            def:'free', feature:true },
+  { key:'payroll',       label:'Payroll, payslips & salary advances',        def:'free', feature:true }
 ];
 const VIEW_FEATURE_MAP = {};
 MODULE_DEFS.forEach(function(m){ if (m.view) VIEW_FEATURE_MAP[m.view] = m.key; });
@@ -620,7 +607,7 @@ function calcDoc(doc,db){
 /* ============================================================
    AUTH
    ============================================================ */
-var authMode='register';
+var authMode='login';
 /* ---------- Invite link handling on the sign-in screen ---------- */
 var _inviteInfo = null;
 (function captureInviteCode(){
@@ -665,6 +652,7 @@ function setAuthMode(m){
 }
 document.getElementById('authToggle').onclick=()=>setAuthMode(authMode==='register'?'login':'register');
 document.getElementById('authBtn').onclick = doAuth;
+setAuthMode(authMode);
 _showInviteBanner();
 async function doAuth() {
   const email = document.getElementById('a_email').value.trim().toLowerCase();
@@ -715,8 +703,11 @@ function launchApp(){
   document.getElementById('auth').style.display='none';
   document.getElementById('app').style.display='block';
   renderIcons();
+  _ensureShops();
   refreshChrome();
   go('dashboard');
+  if (State.isAdmin) _loadAdminRequests().then(function(){ refreshChrome(); if (State.user && State.user.pendingPay) toast(State.user.pendingPay + ' Pro payment slip' + (State.user.pendingPay>1?'s':'') + ' waiting for review in Portal Admin'); });
+  else _checkMyRequests();
 }
 document.getElementById('logoutBtn').onclick = async () => {
   clearTimeout(_saveT);
@@ -754,6 +745,9 @@ function refreshChrome(){
     lk.textContent=showOff?'OFF':'PRO';
     lk.style.display=(showOff||featureLocked(key))?'inline-block':'none';
   });
+  if(!document.querySelector('#nav a[data-view="shops"]')){ const st=document.querySelector('#nav a[data-view="stock"]'); if(st){ st.insertAdjacentHTML('afterend','<a data-view="shops"><span class="ic" data-i="shop"></span> Shops</a>'); renderIcons(document.getElementById('nav')); } }
+  const _al=document.getElementById('adminLink'); if(_al){ let b=_al.querySelector('.pay-badge'); const n=(State.user&&State.user.pendingPay)||0; if(n){ if(!b){ b=document.createElement('span'); b.className='lock pay-badge'; _al.appendChild(b);} b.textContent=n; b.style.display='inline-block'; } else if(b) b.style.display='none'; }
+  _renderShopChip();
   const chip=document.querySelector('.biz-chip');
   if(chip&&!chip.dataset.bound){ chip.dataset.bound='1'; chip.style.cursor='pointer'; chip.title='Switch business'; chip.setAttribute('role','button'); chip.onclick=openBizSwitcher; chip.insertAdjacentHTML('beforeend','<span class="biz-caret">\u25BE</span>'); }
   var _tn=document.querySelector('#nav a[data-view="team"]'); if(_tn) _tn.style.display=State.isMember?'none':'';
@@ -765,7 +759,7 @@ document.getElementById('upgradeBtn').onclick=openUpgrade;
 /* ============================================================
    ROUTER
    ============================================================ */
-const TITLES={dashboard:'Dashboard',items:'Products',stock:'Stock',customers:'Customers',pos:'Point of Sale',employees:'Employees',expenses:'Expenses',gst:'GST',zakat:'Zakat Calculator',quotations:'Quotations',invoices:'Invoices',deliveries:'Deliveries',orders:'Customer Orders',email:'Email',team:'Team Access',settings:'Settings',admin:'Portal Admin'};
+const TITLES={shops:'Shops',dashboard:'Dashboard',items:'Products',stock:'Stock',customers:'Customers',pos:'Point of Sale',employees:'Employees',expenses:'Expenses',gst:'GST',zakat:'Zakat Calculator',quotations:'Quotations',invoices:'Invoices',deliveries:'Deliveries',orders:'Customer Orders',email:'Email',team:'Team Access',settings:'Settings',admin:'Portal Admin'};
 function go(view){
   if(view==='admin'&&!State.isAdmin){view='dashboard';}
   if(VIEW_FEATURE_MAP[view]&&moduleOff(VIEW_FEATURE_MAP[view])){toast((TITLES[view]||view)+' is not available');view='dashboard';}
@@ -780,7 +774,7 @@ function go(view){
     const views={dashboard:viewDashboard,items:viewItems,stock:viewStock,customers:viewCustomers,
       pos:viewPOS,employees:viewEmployees,expenses:viewExpenses,gst:viewGST,zakat:viewZakat,
       quotations:()=>viewDocs('quote'),invoices:()=>viewDocs('invoice'),deliveries:viewDeliveries,
-      orders:viewCustomerOrders,email:viewEmail,team:viewTeam,settings:viewSettings,admin:viewAdmin};
+      orders:viewCustomerOrders,shops:viewShops,email:viewEmail,team:viewTeam,settings:viewSettings,admin:viewAdmin};
     if(!views[view]){c.innerHTML='<div class="card pad">Unknown view: '+esc(view)+'</div>';return;}
     views[view]();
     renderIcons(c);
@@ -932,10 +926,10 @@ function viewDashboard(){
     ?`<div class="card pad" style="background:var(--accent-soft);border-color:var(--accent);margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><div>✅ <b>Pro Trial active</b> — ${State.trialDaysLeft} days left. Enjoy all Pro features!</div><button class="btn ghost sm" onclick="openUpgrade()">Upgrade</button></div>`
     :'';
   // Inventory stats
-  const trackedItems=(db.items||[]).filter(i=>i.trackStock!==false&&i.stockQty>0);
-  const invCost=trackedItems.reduce((s,i)=>s+(i.stockQty||0)*(i.costPrice||0),0);
-  const invSell=trackedItems.reduce((s,i)=>s+(i.stockQty||0)*(i.unitPrice||0),0);
-  const lowStock=(db.items||[]).filter(i=>i.trackStock!==false&&i.reorderLevel>0&&(i.stockQty||0)<=(i.reorderLevel||0)).length;
+  const trackedItems=(db.items||[]).filter(i=>i.trackStock!==false&&shopQty(i)>0);
+  const invCost=trackedItems.reduce((s,i)=>s+(shopQty(i)||0)*(i.costPrice||0),0);
+  const invSell=trackedItems.reduce((s,i)=>s+(shopQty(i)||0)*(i.unitPrice||0),0);
+  const lowStock=(db.items||[]).filter(i=>i.trackStock!==false&&i.reorderLevel>0&&(shopQty(i)||0)<=(i.reorderLevel||0)).length;
   document.getElementById('content').innerHTML=trialBanner+`
    <div class="grid kpis" style="margin-bottom:10px">
      <div class="card kpi"><div class="lbl">Outstanding</div><div class="val">${money(outstanding)}</div><div class="sub muted">${unpaid.length} unpaid</div></div>
@@ -994,7 +988,7 @@ function itemCards(items){
   return `<div class="mob-cards">${items.map(i=>{
     const m=marginPct(i);
     const tracked=i.trackStock!==false;
-    const qty=i.stockQty||0;
+    const qty=shopQty(i)||0;
     const stkCls=!tracked?'':qty<=0?'stk-out':i.reorderLevel>0&&qty<=i.reorderLevel?'stk-low':'stk-good';
     return`
     <div class="mob-card">
@@ -1029,7 +1023,7 @@ function itemCards(items){
 var itemSearch='';
 function viewItems(){
   const items=State.db.items.filter(i=>(i.name+(i.sku||'')+(i.barcode||'')).toLowerCase().includes(itemSearch.toLowerCase()));
-  const totalCost=State.db.items.filter(i=>i.trackStock!==false&&i.stockQty>0).reduce((s,i)=>s+(i.stockQty||0)*(i.costPrice||0),0);
+  const totalCost=State.db.items.filter(i=>i.trackStock!==false&&shopQty(i)>0).reduce((s,i)=>s+(shopQty(i)||0)*(i.costPrice||0),0);
   document.getElementById('content').innerHTML=`
    <div class="toolbar">
      <div class="search">${svg('search')}<input placeholder="Search products…" value="${esc(itemSearch)}" oninput="itemSearch=this.value;viewItems()"></div>
@@ -1040,12 +1034,12 @@ function viewItems(){
    </div>
    ${totalCost>0?`<div class="card pad" style="margin-bottom:12px;display:flex;gap:20px;flex-wrap:wrap;border-left:3px solid var(--accent)">
      <div class="inv-stat"><div class="lbl">Total inventory cost value</div><div class="val">${money(totalCost)}</div></div>
-     <div class="inv-stat"><div class="lbl">Stock lines tracked</div><div class="val">${State.db.items.filter(i=>i.trackStock!==false&&i.stockQty>0).length}</div></div>
+     <div class="inv-stat"><div class="lbl">Stock lines tracked</div><div class="val">${State.db.items.filter(i=>i.trackStock!==false&&shopQty(i)>0).length}</div></div>
    </div>`:''}
    ${isMob()?itemCards(items):`<div class="tbl"><table><thead><tr><th>Product</th><th>SKU / Barcode</th><th>Unit</th><th class="right">Cost</th><th class="right">Selling</th><th>Margin</th><th class="right">Stock</th><th>Tax</th><th></th></tr></thead><tbody>
      ${items.map(i=>{
         const tracked=i.trackStock!==false;
-        const qty=i.stockQty||0;
+        const qty=shopQty(i)||0;
         const stkCls=!tracked?'':qty<=0?'stk-out':i.reorderLevel>0&&qty<=i.reorderLevel?'stk-low':'stk-good';
         return`<tr>
         <td><div style="display:flex;align-items:center;gap:10px">
@@ -1067,6 +1061,7 @@ function viewItems(){
   `;
   renderIcons(document.getElementById('content'));
 }
+function _itemShopQty(id){ const it=State.db.items.find(i=>i.id===id); const el=document.getElementById('i_sqty'); if(el) el.value=it?qtyIn(it,val('i_shop')):0; }
 function openItemEditor(id){
   const it=id?State.db.items.find(i=>i.id===id):{name:'',sku:'',barcode:'',desc:'',unitPrice:'',costPrice:'',unit:'pc',taxable:true};
   openModal(`${id?'Edit':'New'} product`,`
@@ -1112,7 +1107,8 @@ function openItemEditor(id){
     </div>
     <div id="i_stkfields" style="display:${it.trackStock!==false?'block':'none'}">
       <div class="fgrid" style="margin-top:8px">
-        <div class="field"><label>Current stock qty</label><input id="i_sqty" type="number" step="1" value="${it.stockQty||0}"></div>
+        ${_multiShop()?'<div class="field"><label>Shop</label><select id="i_shop" onchange="_itemShopQty(\''+(id||'')+'\')">'+_activeShops().map(s=>'<option value="'+s.id+'"'+(s.id===(State.shopId||_defaultShopId())?' selected':'')+'>'+esc(s.name)+'</option>').join('')+'</select></div>':''}
+        <div class="field"><label>${_multiShop()?'Stock in this shop':'Current stock qty'}</label><input id="i_sqty" type="number" step="1" value="${_multiShop()?qtyIn(it,State.shopId||_defaultShopId()):(it.stockQty||0)}"></div>
         <div class="field"><label>Reorder level (alert when ≤)</label><input id="i_reord" type="number" step="1" value="${it.reorderLevel||0}" placeholder="e.g. 5"></div>
         <div class="field"><label>Reorder quantity</label><input id="i_reordqty" type="number" step="1" value="${it.reorderQty||0}" placeholder="Standard order amount"></div>
         ${id&&it.trackStock!==false?`<div class="field" style="align-self:end"><label>Stock cost value</label>
@@ -1124,19 +1120,20 @@ function openItemEditor(id){
       const sell=+val('i_price')||0;if(!sell)return toast('Selling price is required');
       const trackStock=val('i_track')==='1';
       const newStockQty=trackStock?+val('i_sqty')||0:0;
-      const oldStockQty=id?((State.db.items.find(i=>i.id===id)||{}).stockQty||0):0;
+      const _ex=id?(State.db.items.find(i=>i.id===id)||{}):{}; const _esh=(document.getElementById('i_shop')||{}).value||State.shopId||_defaultShopId();
+      const oldStockQty=id?(_multiShop()?qtyIn(_ex,_esh):(_ex.stockQty||0)):0;
       const rec={id:id||uid(),name,sku:val('i_sku'),barcode:val('i_barcode'),unit:val('i_unit')||'pc',desc:val('i_desc'),
         image:window._itemImgDataUrl||(it&&it.image)||null,
         costPrice:+val('i_cost')||0,unitPrice:sell,taxable:val('i_tax')==='1',
         trackStock,
-        stockQty: id ? oldStockQty : 0,
+        stockQty: id ? (_ex.stockQty||0) : 0, shopStock: id ? JSON.parse(JSON.stringify(_ex.shopStock||{})) : {},
         reorderLevel:trackStock?+val('i_reord')||0:0,reorderQty:trackStock?+val('i_reordqty')||0:0};
       if(id){const ix=State.db.items.findIndex(i=>i.id===id);State.db.items[ix]=rec;}else State.db.items.push(rec);
       // Auto-create movement record when stock qty changes
       if(trackStock){
         const delta=newStockQty-oldStockQty;
-        if(!id&&newStockQty>0) addStockMovement(rec.id,'receive',newStockQty,'initial','Opening stock');
-        else if(id&&delta!==0) addStockMovement(rec.id,'adjust',delta,'manual','Stock updated via product editor');
+        if(!id&&newStockQty>0) addStockMovement(rec.id,'receive',newStockQty,'initial','Opening stock',_esh);
+        else if(id&&delta!==0) addStockMovement(rec.id,'adjust',delta,'manual','Stock updated via product editor',_esh);
       }
       persist();closeModal();viewItems();toast(id?'Product updated':'Product added');
     }}]);
@@ -1168,26 +1165,18 @@ function delItem(id){confirmDel('Delete this product?',()=>{State.db.items=State
 /* ============================================================
    STOCK MANAGEMENT
    ============================================================ */
-function addStockMovement(itemId,type,qty,reference,note){
-  const item=State.db.items.find(i=>i.id===itemId);if(!item)return;
-  item.stockQty=(item.stockQty||0)+qty;
-  if(!State.db.stockMovements)State.db.stockMovements=[];
-  State.db.stockMovements.unshift({id:uid(),date:todayISO(),time:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),
-    itemId,itemName:item.name,type,qty,reference:reference||'manual',note:note||'',balance:item.stockQty});
-  if(State.db.stockMovements.length>600)State.db.stockMovements.length=600;
-}
 function stockBadgeHtml(i){
   if(i.trackStock===false)return'<span class="muted" style="font-size:12px">—</span>';
-  const q=i.stockQty||0;
+  const q=shopQty(i)||0;
   const cls=q<=0?'stk-out':i.reorderLevel>0&&q<=i.reorderLevel?'stk-low':'stk-good';
   return`<span class="stk-badge ${cls}">${q<=0?'Out of stock':q+' '+esc(i.unit||'pc')}</span>`;
 }
 var _stockTab='overview';
 function viewStock(){
   const tracked=(State.db.items||[]).filter(i=>i.trackStock!==false);
-  const totalCost=tracked.reduce((s,i)=>s+(i.stockQty||0)*(i.costPrice||0),0);
-  const totalSell=tracked.reduce((s,i)=>s+(i.stockQty||0)*(i.unitPrice||0),0);
-  const lowStock=tracked.filter(i=>i.reorderLevel>0&&(i.stockQty||0)<=i.reorderLevel);
+  const totalCost=tracked.reduce((s,i)=>s+(shopQty(i)||0)*(i.costPrice||0),0);
+  const totalSell=tracked.reduce((s,i)=>s+(shopQty(i)||0)*(i.unitPrice||0),0);
+  const lowStock=tracked.filter(i=>i.reorderLevel>0&&(shopQty(i)||0)<=i.reorderLevel);
   const c=document.getElementById('content');
   c.innerHTML=`
    <div class="card" style="padding:12px 18px;margin-bottom:14px;display:flex;gap:0;flex-wrap:wrap;border-left:3px solid var(--accent)">
@@ -1204,6 +1193,7 @@ function viewStock(){
      <button class="${_stockTab==='movements'?'active':''}" onclick="_stockTab='movements';viewStock()">Movements</button>
      <button class="${_stockTab==='audit'?'active':''}" onclick="_stockTab='audit';viewStock()">Stock Count (Audit)</button>
    </div>
+   ${_multiShop()?'<div style="margin:-4px 0 12px"><button class="btn ghost sm" onclick="openStockTransfer()">\u21C4 Transfer between shops</button></div>':''}
    <div id="stockPanel"></div>`;
   if(_stockTab==='overview')     renderStockOverview(tracked,lowStock);
   else if(_stockTab==='movements') renderStockMovements();
@@ -1217,21 +1207,21 @@ function renderStockOverview(tracked,lowStock){
       <b>⚠ Low stock alerts</b>
       <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
         ${lowStock.map(i=>`<div style="background:var(--card);border:1px solid var(--amber);border-radius:9px;padding:7px 12px;font-size:13px">
-          <b>${esc(i.name)}</b> — ${i.stockQty||0} ${esc(i.unit||'pc')} (reorder at ${i.reorderLevel})
+          <b>${esc(i.name)}</b> — ${shopQty(i)||0} ${esc(i.unit||'pc')} (reorder at ${i.reorderLevel})
           <button class="btn amber tiny" style="margin-left:8px" onclick='openStockAdjust("${i.id}")'>Receive stock</button>
         </div>`).join('')}
       </div>
     </div>`;
   }
   const rows=tracked.sort((a,b)=>(a.name||'').localeCompare(b.name||''));
-  const grandCost=rows.reduce((s,i)=>s+(i.stockQty||0)*(i.costPrice||0),0);
-  const grandSell=rows.reduce((s,i)=>s+(i.stockQty||0)*(i.unitPrice||0),0);
+  const grandCost=rows.reduce((s,i)=>s+(shopQty(i)||0)*(i.costPrice||0),0);
+  const grandSell=rows.reduce((s,i)=>s+(shopQty(i)||0)*(i.unitPrice||0),0);
   p.innerHTML+=`<div class="tbl"><table><thead><tr>
     <th>Product</th><th class="right">Stock qty</th><th class="right">Reorder at</th>
     <th class="right">Cost/unit</th><th class="right">Stock cost value</th><th class="right">Stock sell value</th><th></th>
   </tr></thead><tbody>
   ${rows.map(i=>{
-    const qty=i.stockQty||0, cv=qty*(i.costPrice||0), sv=qty*(i.unitPrice||0);
+    const qty=shopQty(i)||0, cv=qty*(i.costPrice||0), sv=qty*(i.unitPrice||0);
     const cls=qty<=0?'stk-out':i.reorderLevel>0&&qty<=i.reorderLevel?'stk-low':'stk-good';
     return`<tr>
       <td style="font-weight:600">${esc(i.name)}<div class="muted" style="font-size:11px">${esc(i.unit||'pc')}</div></td>
@@ -1254,13 +1244,13 @@ function renderStockOverview(tracked,lowStock){
 }
 function renderStockMovements(){
   const p=document.getElementById('stockPanel');
-  const mvs=(State.db.stockMovements||[]).slice(0,200);
-  const typeLabel={receive:'📥 Receive',sale:'🛒 Sale',adjust:'✏️ Adjust',count:'📋 Count'};
-  const typeCls={receive:'mv-in',sale:'mv-out',adjust:'mv-adj',count:'mv-count'};
+  const mvs=(State.db.stockMovements||[]).filter(_inShop).slice(0,200);
+  const typeLabel={receive:'📥 Receive',sale:'🛒 Sale',adjust:'✏️ Adjust',count:'📋 Count',transfer:'⇄ Transfer'};
+  const typeCls={receive:'mv-in',sale:'mv-out',adjust:'mv-adj',count:'mv-count',transfer:'mv-adj'};
   if(!mvs.length){p.innerHTML=emptyBox('No stock movements yet','Movements are recorded automatically from POS sales and manual adjustments.');return;}
   if(isMob()){
     p.innerHTML=`<div class="mob-cards">${mvs.map(m=>`<div class="mob-card">
-      <div class="mob-card-top"><span class="mv-pill ${typeCls[m.type]||'mv-adj'}">${typeLabel[m.type]||m.type}</span><span class="muted" style="font-size:12px">${fmtDate(m.date)}</span></div>
+      <div class="mob-card-top"><span class="mv-pill ${typeCls[m.type]||'mv-adj'}">${typeLabel[m.type]||m.type}</span><span class="muted" style="font-size:12px">${fmtDate(m.date)}${_shopTag(m)}</span></div>
       <div class="mob-card-name">${esc(m.itemName)}</div>
       <div class="mob-card-meta">${esc(m.reference||'')}${m.note?` · ${esc(m.note)}`:''}</div>
       <div class="mob-card-foot">
@@ -1271,7 +1261,7 @@ function renderStockMovements(){
   } else {
     p.innerHTML=`<div class="tbl"><table><thead><tr><th>Date</th><th>Product</th><th>Type</th><th class="right">Movement</th><th class="right">Balance</th><th>Reference</th><th>Note</th></tr></thead><tbody>
     ${mvs.map(m=>`<tr>
-      <td class="muted" style="white-space:nowrap">${fmtDate(m.date)}${m.time?' '+m.time:''}</td>
+      <td class="muted" style="white-space:nowrap">${fmtDate(m.date)}${_shopTag(m)}${m.time?' '+m.time:''}</td>
       <td style="font-weight:600">${esc(m.itemName)}</td>
       <td><span class="mv-pill ${typeCls[m.type]||'mv-adj'}">${typeLabel[m.type]||m.type}</span></td>
       <td class="right mono" style="font-weight:700;color:${m.qty>0?'var(--accent)':'var(--danger)'}">${m.qty>0?'+':''}${m.qty}</td>
@@ -1285,6 +1275,7 @@ function renderStockMovements(){
 var _auditRows={};
 function renderStockAudit(tracked){
   const p=document.getElementById('stockPanel');
+  const _ns=_needShop('Count stock in which shop?'); if(_ns){ p.innerHTML=_ns; return; }
   _auditRows={};
   p.innerHTML=`
   <div class="card pad" style="margin-bottom:12px;font-size:13.5px;background:var(--accent-soft);border-color:var(--accent)">
@@ -1299,8 +1290,8 @@ function renderStockAudit(tracked){
     <div class="ah ar">Cost impact</div>
     ${tracked.map(i=>`
       <div class="ac" style="display:block">${esc(i.name)}<div class="muted" style="font-size:11px">${esc(i.unit||'pc')}</div></div>
-      <div class="ac ar"><span class="mono">${i.stockQty||0}</span></div>
-      <div class="ac ar"><input type="number" step="1" min="0" id="audit_${i.id}" value="${i.stockQty||0}" oninput="calcAuditRow('${i.id}',${i.stockQty||0},${i.costPrice||0})"></div>
+      <div class="ac ar"><span class="mono">${shopQty(i)||0}</span></div>
+      <div class="ac ar"><input type="number" step="1" min="0" id="audit_${i.id}" value="${shopQty(i)||0}" oninput="calcAuditRow('${i.id}',${shopQty(i)||0},${i.costPrice||0})"></div>
       <div class="ac ar" id="avar_${i.id}">—</div>
       <div class="ac ar" id="acost_${i.id}" style="font-size:12.5px">—</div>`).join('')}
   </div>
@@ -1328,7 +1319,7 @@ function saveStockCount(){
   tracked.forEach(i=>{
     const counted=+document.getElementById('audit_'+i.id)?.value;
     if(isNaN(counted))return;
-    const system=i.stockQty||0;
+    const system=shopQty(i)||0;
     const variance=counted-system;
     auditItems.push({itemId:i.id,itemName:i.name,system,counted,variance,costImpact:variance*(i.costPrice||0)});
     if(variance!==0){addStockMovement(i.id,'count',variance,'stock-count','Physical stock count audit');adjustCount++;}
@@ -1342,16 +1333,17 @@ function saveStockCount(){
 }
 function resetAuditInputs(){
   const tracked=(State.db.items||[]).filter(i=>i.trackStock!==false);
-  tracked.forEach(i=>{const el=document.getElementById('audit_'+i.id);if(el)el.value=i.stockQty||0;});
+  tracked.forEach(i=>{const el=document.getElementById('audit_'+i.id);if(el)el.value=shopQty(i)||0;});
 }
 function openStockAdjust(itemId){
   const items=(State.db.items||[]).filter(i=>i.trackStock!==false);
   const pre=itemId?items.find(x=>x.id===itemId):null;
   openModal('Adjust stock',`
     <div class="fgrid">
+      ${_multiShop()?'<div class="field full"><label>Shop</label><select id="sa_shop" onchange="updateStockAdjustBalance()">'+_activeShops().map(s=>'<option value="'+s.id+'"'+(s.id===(State.shopId||_defaultShopId())?' selected':'')+'>'+esc(s.name)+'</option>').join('')+'</select></div>':''}
       <div class="field full"><label>Product *</label>
         <select id="sa_item" onchange="updateStockAdjustBalance()">
-          ${items.map(i=>`<option value="${i.id}" ${i.id===(itemId||'')?'selected':''}>${esc(i.name)} (current: ${i.stockQty||0} ${esc(i.unit||'pc')})</option>`).join('')}
+          ${items.map(i=>`<option value="${i.id}" ${i.id===(itemId||'')?'selected':''}>${esc(i.name)} (current: ${shopQty(i)||0} ${esc(i.unit||'pc')})</option>`).join('')}
         </select></div>
       <div class="field"><label>Movement type</label>
         <select id="sa_type">
@@ -1360,7 +1352,7 @@ function openStockAdjust(itemId){
           <option value="sale">🛒 Manual issue (remove)</option>
         </select></div>
       <div class="field"><label>Quantity (always positive)</label><input id="sa_qty" type="number" step="1" min="0" placeholder="0"></div>
-      <div class="field"><label>Current balance</label><div id="sa_balance" style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-weight:700;background:var(--paper)">${pre?(pre.stockQty||0)+' '+(pre.unit||'pc'):'—'}</div></div>
+      <div class="field"><label>Current balance</label><div id="sa_balance" style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-weight:700;background:var(--paper)">${pre?(shopQty(pre)||0)+' '+(pre.unit||'pc'):'—'}</div></div>
       <div class="field"><label>Reference (optional)</label><input id="sa_ref" placeholder="e.g. PO-001 / Supplier name"></div>
       <div class="field"><label>Note (optional)</label><input id="sa_note" placeholder="Reason for adjustment"></div>
     </div>`,
@@ -1369,17 +1361,19 @@ function openStockAdjust(itemId){
       if(!iid)return toast('Select a product');if(!qty||qty<0)return toast('Enter a positive quantity');
       const type=val('sa_type');
       const delta=(type==='receive'?1:-1)*qty;
-      addStockMovement(iid,type,delta,val('sa_ref')||'manual',val('sa_note'));
+      addStockMovement(iid,type,delta,val('sa_ref')||'manual',val('sa_note'),_adjShop());
       persist();closeModal();
       toast('Stock movement saved');
       if(State.view==='stock')viewStock();else if(State.view==='items')viewItems();
     }}]);
+  setTimeout(updateStockAdjustBalance,30);
 }
+function _adjShop(){ const e=document.getElementById('sa_shop'); return (e&&e.value)||State.shopId||_defaultShopId(); }
 function updateStockAdjustBalance(){
   const id=document.getElementById('sa_item')?.value;
   const item=State.db.items.find(i=>i.id===id);
   const el=document.getElementById('sa_balance');
-  if(el&&item)el.textContent=(item.stockQty||0)+' '+(item.unit||'pc');
+  if(el&&item)el.textContent=qtyIn(item,_multiShop()?_adjShop():'')+' '+(item.unit||'pc');
 }
 
 
@@ -3495,48 +3489,6 @@ function stopScan(){
    EMPLOYEES
    ============================================================ */
 var EMP_FREE_LIMIT = 5;
-function viewEmployees(){
-  if(!State.db){toast("Loading… please wait");return;}
-  const emps=State.db.employees||[];
-  const atLimit=featureLocked('multiEmployee')&&emps.length>=EMP_FREE_LIMIT;
-  document.getElementById('content').innerHTML=`
-   <div class="between" style="margin-bottom:16px">
-     <div>
-       <p class="muted" style="font-size:13px;margin-top:3px">Employees can log in to the POS with a PIN. Free plan: up to ${EMP_FREE_LIMIT} employees.</p>
-     </div>
-     <button class="btn accent" onclick="openEmpEditor()" ${atLimit?'disabled':''} title="${atLimit?'Upgrade to Pro to add more employees':'Add employee'}">${svg('plus')} Add employee</button>
-   </div>
-   ${atLimit?`<div class="card pad" style="background:var(--amber-soft);border-color:var(--amber);margin-bottom:14px"><div class="row" style="gap:10px">${svg('lock',18)}<div><b>Employee limit reached (${EMP_FREE_LIMIT}).</b> <a class="linkish" onclick="openUpgrade()">Upgrade to Pro</a> for unlimited employees.</div></div></div>`:''}
-   ${emps.length?`<div class="tbl"><table><thead><tr><th>Name</th><th>Role</th><th>PIN set</th><th>Status</th><th></th></tr></thead><tbody>
-     ${emps.map(e=>`<tr>
-       <td style="font-weight:600"><div class="row" style="gap:9px"><div class="emp-avt" style="width:32px;height:32px;font-size:14px;flex-shrink:0">${(e.name||'?')[0].toUpperCase()}</div>${esc(e.name)}</div></td>
-       <td><span class="pill ${e.role==='manager'?'sent':'draft'}">${e.role||'cashier'}</span></td>
-       <td>${e.pin?'<span class="pill paid">●●●●</span>':'<span class="muted">Not set</span>'}</td>
-       <td><select class="pill ${e.active!==false?'paid':'draft'}" style="border:none;font-weight:600;cursor:pointer" onchange="setEmpActive('${e.id}',this.value==='active')"><option value="active" ${e.active!==false?'selected':''}>Active</option><option value="inactive" ${e.active===false?'selected':''}>Inactive</option></select></td>
-       <td><div class="rowacts"><button class="iconbtn" onclick='openEmpEditor("${e.id}")'>${svg('edit')}</button><button class="iconbtn" onclick='delEmployee("${e.id}")'>${svg('trash')}</button></div></td>
-     </tr>`).join('')}
-   </tbody></table></div>`:emptyBox('No employees yet','Add employees so they can log in to the POS with a PIN.')}`;
-  renderIcons(document.getElementById('content'));
-}
-function openEmpEditor(id){
-  const e=id?(State.db.employees||[]).find(x=>x.id===id):{name:'',role:'cashier',pin:'',active:true};
-  openModal(`${id?'Edit':'New'} employee`,`
-    <div class="fgrid">
-      <div class="field full"><label>Full name *</label><input id="em_name" value="${esc(e.name||'')}"></div>
-      <div class="field"><label>Role</label><select id="em_role"><option value="cashier" ${(e.role||'cashier')==='cashier'?'selected':''}>Cashier</option><option value="manager" ${e.role==='manager'?'selected':''}>Manager</option></select></div>
-      <div class="field"><label>4-digit PIN</label><input id="em_pin" type="password" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" value="${esc(e.pin||'')}" placeholder="Leave blank to keep unchanged"></div>
-      <div class="field"><label>Status</label><select id="em_act"><option value="1" ${e.active!==false?'selected':''}>Active</option><option value="0" ${e.active===false?'selected':''}>Inactive</option></select></div>
-    </div>`,
-    [{label:'Cancel',cls:'ghost',fn:closeModal},{label:id?'Save':'Add employee',cls:'accent',fn:()=>{
-      const name=val('em_name');if(!name)return toast('Name is required');
-      const pin=val('em_pin'); if(pin&&!/^\d{4}$/.test(pin))return toast('PIN must be exactly 4 digits');
-      if(!State.db.employees)State.db.employees=[];
-      const rec={id:id||uid(),name,role:val('em_role'),pin:pin||(id?(State.db.employees.find(x=>x.id===id)||{}).pin:''),active:val('em_act')==='1'};
-      if(id){const ix=State.db.employees.findIndex(x=>x.id===id);State.db.employees[ix]=rec;}else State.db.employees.push(rec);
-      persist();closeModal();viewEmployees();toast(id?'Employee updated':'Employee added');
-    }}]);
-}
-
 function handleItemImage(file){
   if(!file)return;
   if(!file.type.startsWith('image/')){toast('Please select an image file');return;}
@@ -3562,8 +3514,6 @@ function handleItemImage(file){
   reader.readAsDataURL(file);
 }
 
-function setEmpActive(id,active){const e=(State.db.employees||[]).find(x=>x.id===id);if(e){e.active=active;persist();}}
-function delEmployee(id){confirmDel('Delete this employee?',()=>{State.db.employees=(State.db.employees||[]).filter(e=>e.id!==id);persist();viewEmployees();toast('Employee removed');});}
 
 
 
@@ -3574,7 +3524,8 @@ function delEmployee(id){confirmDel('Delete this employee?',()=>{State.db.employ
 var posCart=[], posCashier=null, posPayMethod='cash', _posTab='items';
 function viewPOS(){
   if(!State.db){toast("Loading… please wait");return;}
-  const emps=(State.db.employees||[]).filter(e=>e.active!==false);
+  const _ns=_needShop('Open the register for which shop?'); if(_ns){ document.getElementById('content').innerHTML=_ns; return; }
+  const emps=(State.db.employees||[]).filter(e=>e.active!==false&&(!_multiShop()||!e.shopId||e.shopId===State.shopId));
   if(!posCashier){
     if(!emps.length){posCashier={name:State.db.settings.businessName||'Owner',role:'manager'};renderPOS();return;}
     showEmpLogin(emps);
@@ -3644,9 +3595,9 @@ function renderPOS(){
     <div class="pos-wrap">
       <div class="pos-items-panel" style="${mob&&_posTab==='cart'?'display:none':''}">
         <div class="search" style="margin-bottom:10px">${svg('search')}<input placeholder="Search products…" value="${esc(_posSearch||'')}" oninput="_posSearch=this.value;renderPOS()"><button class="iconbtn" style="position:absolute;right:4px;top:50%;transform:translateY(-50%)" title="Scan barcode" onclick="openBarcodeScanner(v=>{const it=State.db.items.find(i=>i.barcode===v||i.sku===v);if(it){addToCart(it.id);if((window.innerWidth<768)){_posTab='cart';renderPOS();}}else{_posSearch=v;renderPOS();toast('No product found for: '+v);}})">${svg('scan',15)}</button></div>
-        ${items.length?`<div class="pos-grid">${items.map(i=>{const inCart=posCart.find(c=>c.itemId===i.id);return`<div class="pos-tile ${i.trackStock!==false&&(i.stockQty||0)<=0?'stk-dim':''}" onclick="addToCart('${i.id}')">
+        ${items.length?`<div class="pos-grid">${items.map(i=>{const inCart=posCart.find(c=>c.itemId===i.id);return`<div class="pos-tile ${i.trackStock!==false&&(shopQty(i)||0)<=0?'stk-dim':''}" onclick="addToCart('${i.id}')">
           ${inCart?`<div class="pt-badge">${inCart.qty}</div>`:''}
-          ${i.trackStock!==false?`<div class="stk-tile ${(i.stockQty||0)<=0?'stk-out':(i.reorderLevel>0&&(i.stockQty||0)<=i.reorderLevel?'stk-low':'stk-good')}">${(i.stockQty||0)<=0?'Out':(i.stockQty||0)}</div>`:''}
+          ${i.trackStock!==false?`<div class="stk-tile ${(shopQty(i)||0)<=0?'stk-out':(i.reorderLevel>0&&(shopQty(i)||0)<=i.reorderLevel?'stk-low':'stk-good')}">${(shopQty(i)||0)<=0?'Out':(shopQty(i)||0)}</div>`:''}
           <div class="pt-name">${esc(i.name)}</div>
           <div class="pt-sku">${esc(i.sku||i.unit||'')}</div>
           <div class="pt-price">${money(i.unitPrice)}</div>
@@ -3689,7 +3640,7 @@ function addToCart(itemId){
   if(item.trackStock!==false){
     const inCart=posCart.find(c=>c.itemId===itemId);
     const cartQty=inCart?inCart.qty:0;
-    const available=(item.stockQty||0)-cartQty;
+    const available=(shopQty(item)||0)-cartQty;
     if(available<=0){toast('⚠ '+item.name+' is out of stock');return;}
   }
   const ex=posCart.find(c=>c.itemId===itemId);
@@ -3723,7 +3674,7 @@ function posCheckout(){
         date:todayISO(),time:new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),
         cashier:posCashier.name,customer:document.getElementById('pos_cust')?.value||'Walk-in',
         lineItems:JSON.parse(JSON.stringify(posCart)),totals:{...t,tendered,change:+(tendered-t.total).toFixed(2)},
-        paymentMethod:posPayMethod};
+        paymentMethod:posPayMethod,shopId:State.shopId||_defaultShopId()};
       if(!State.db.transactions)State.db.transactions=[];
       State.db.transactions.unshift(txn);
       State.db.counters.pos=(State.db.counters.pos||1)+1;
@@ -3759,10 +3710,10 @@ function printReceipt(txn){
   </div>`;
   setTimeout(()=>window.print(),100);
   toast('Printing receipt…');
-  setTimeout(()=>renderPOS(),800);
+  setTimeout(()=>{ if(State.view==='pos'&&posCashier) renderPOS(); },800);   // only if the register is still open
 }
 function viewPOSHistory(){
-  const txns=(State.db.transactions||[]).slice(0,50);
+  const txns=(State.db.transactions||[]).filter(_inShop).slice(0,50);
   const c=document.getElementById('content');
   const total=txns.reduce((s,t)=>s+t.totals.total,0);
   c.innerHTML=`
@@ -3943,10 +3894,6 @@ function removeInvite(code){
 }
 
 /* ---------- Staff POS link: shortcut in the POS tab + Settings ---------- */
-function posStaffUrl(){
-  var s = (State.db && State.db.settings) || {};
-  return location.href.split(/[?#]/)[0].replace(/[^/]*$/, '') + 'pos.html?t=' + encodeURIComponent(s.posToken || '');
-}
 function openPosLink(){ window.open(posStaffUrl(), '_blank'); }
 function copyPosLink(){
   var link = posStaffUrl();
@@ -3968,7 +3915,7 @@ function sharePosLink(){
 }
 function addUOM(){const v=val('s_newuom').trim();if(!v)return;if(!State.db.settings.uoms)State.db.settings.uoms=[];if(State.db.settings.uoms.includes(v))return toast('Already in list');State.db.settings.uoms.push(v);persist();viewSettings();toast('Unit added');}
 function removeUOM(u){State.db.settings.uoms=(State.db.settings.uoms||[]).filter(x=>x!==u);persist();const tags=document.getElementById('uomTagList');if(tags)tags.innerHTML=State.db.settings.uoms.map(x=>`<span class="uom-tag">${esc(x)}<button onclick="removeUOM('${esc(x)}')">×</button></span>`).join('');}
-function resetPosToken(){confirmDel('Reset the POS link? All staff will need to bookmark the new URL.',()=>{const old=State.db.settings.posToken;State.db.settings.posToken=uid();if(old)_fdb.collection('pos_portals').doc(old).delete().catch(()=>{});persist();viewSettings();toast('POS access link has been reset.');});}
+function resetPosToken(){confirmDel('Reset the POS link? All staff will need to bookmark the new URL.',()=>{const old=State.db.settings.posToken;State.db.settings.posToken=_randCode(20);if(State.db.shops&&State.db.shops[0])State.db.shops[0].posToken=State.db.settings.posToken;if(old)_fdb.collection('pos_portals').doc(old).delete().catch(()=>{});persist();viewSettings();toast('POS access link has been reset.');});}
 
 
 
@@ -3992,6 +3939,7 @@ async function viewAdmin(){
       _fdb.collection('biz_index').get().catch(function(){ return { docs:[] }; })
     ]);
     _adminBiz = bsnap.docs.map(function(d){ return Object.assign({ bizId:d.id }, d.data()); });
+    await _loadAdminRequests();
     _adminUsers = snap.docs.map(function(d){
       const pi = d.data(), st = planStatus(pi);
       const biz = _adminBiz.filter(function(b){ return b.ownerUid === d.id; });
@@ -4012,9 +3960,10 @@ function renderAdminView(){
   const c = document.getElementById('content');
   c.innerHTML = '<div class="tabs">' +
     '<button class="' + (_adminTab==='users'?'active':'') + '" onclick="_adminTab=\'users\';renderAdminView()">Accounts</button>' +
+    '<button class="' + (_adminTab==='payments'?'active':'') + '" onclick="_adminTab=\'payments\';renderAdminView()">Payments' + _pendingBadge() + '</button>' +
     '<button class="' + (_adminTab==='settings'?'active':'') + '" onclick="_adminTab=\'settings\';renderAdminView()">Platform settings</button>' +
   '</div><div id="adminPanel"></div>';
-  if (_adminTab === 'users') renderAdmin(_adminQuery); else renderAdminSettings();
+  if (_adminTab === 'users') renderAdmin(_adminQuery); else if (_adminTab === 'payments') renderAdminPayments(); else renderAdminSettings();
 }
 function renderAdmin(q){
   _adminQuery = q || '';
@@ -4191,6 +4140,7 @@ async function renderAdminSettings(){
           <div class="field"><label>Currency symbol</label><input id="cfg_sym" value="${esc(c.currency||'Rf')}"></div>
           <div class="field"><label>Annual price (0=off)</label><input id="cfg_aprx" type="number" value="${c.proAnnualPrice||0}"></div>
           <div class="field"><label>Annual label</label><input id="cfg_albl" value="${esc(c.annualLabel||'Save 20%')}"></div>
+          <div class="field full"><label>Bank details shown to users buying Pro</label><textarea id="cfg_paybank" rows="3" placeholder="Bank: BML&#10;Account: 7730000000000&#10;Name: Wadde Online">${esc(c.payBank||'')}</textarea></div>
         </div>
       </div>
       <div class="cfg-section"><h4>Free trial</h4>
@@ -4264,7 +4214,7 @@ async function saveAdminSettings(){
     trialEnabled:val('cfg_trial')==='1', trialDays:+val('cfg_tdays')||14, trialRequiresCard:val('cfg_tcard')==='1',
     reminderEnabled:val('cfg_rem')==='1', reminderDays:(val('cfg_remdays')||'7,3,1').split(',').map(n=>+n.trim()).filter(Boolean),
     maxFreeEmployees:+val('cfg_maxemp')||5, maxFreeProducts:+val('cfg_maxprod')||0,
-    proFeatures, modules:_mm.modules,
+    proFeatures, modules:_mm.modules, payBank:val('cfg_paybank'),
     announcement:val('cfg_ann'), announcementType:val('cfg_anntype'),
     registrationClosed:val('cfg_reg')==='0'
   };
@@ -4305,12 +4255,8 @@ function openUpgrade(){
        <ul>${proList.map(f=>`<li>${svg('check')}${f}</li>`).join('')}</ul>
        <button class="btn amber block" onclick="startCheckout()">${isPro()?'Pro active ✓':'Upgrade now — '+sym+' '+price+'/mo'}</button></div>
    </div>
-   <p class="muted" style="font-size:12px;margin-top:14px;text-align:center">Contact <a class="linkish" href="mailto:billing@wadde.online">billing@wadde.online</a> to upgrade or manage your subscription.</p>`,
+   <p class="muted" style="font-size:12px;margin-top:14px;text-align:center">Pay by bank transfer and upload the slip — Pro is activated once the payment is approved. Questions: <a class="linkish" href="mailto:billing@wadde.online">billing@wadde.online</a>. Manage your subscription.</p>`,
    [{label:'Close',cls:'ghost',fn:closeModal}],'lg');
-}
-async function startCheckout(){
-  if(isPro()){closeModal();return;}
-  toast('Contact billing@wadde.online to activate Pro');
 }
 
 /* ============================================================
@@ -4332,7 +4278,7 @@ function confirmDel(msg,fn){openModal('Confirm',`<p>${msg}</p>`,[{label:'Cancel'
   document.querySelector('#modal [data-act="1"]').style.background='var(--danger)';document.querySelector('#modal [data-act="1"]').style.color='#fff';}
 var toastT;function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove('show'),2600);}
 
-setAuthMode('register');
+setAuthMode(authMode);   // opens on Sign in; the link switches to Create account
 renderIcons();
 
 /* Firebase onAuthStateChanged handles auto-login.
@@ -4733,3 +4679,867 @@ function labelTables(root){
     (window.requestAnimationFrame || setTimeout)(function(){ queued = false; labelTables(c); });
   }).observe(c, { childList:true, subtree:true });
 })();
+
+ICONS.shop='<path d="M3 9l1.5-5h15L21 9"/><path d="M3 9h18v1.5a3 3 0 0 1-6 0 3 3 0 0 1-6 0 3 3 0 0 1-6 0z"/><path d="M5 13v7h14v-7"/><path d="M10 20v-4h4v4"/>';
+/* ============================================================
+   SHOPS — several outlets inside one business.
+   Shared: products, customers, quotations, invoices, settings.
+   Per shop: stock levels, POS register + staff POS link, sales, staff.
+   item.shopStock = { shopId: qty }  ·  item.stockQty = total of all shops
+   ============================================================ */
+function _shops(){ return (State.db && State.db.shops) || []; }
+function _activeShops(){ return _shops().filter(function(s){ return s.active !== false; }); }
+function _multiShop(){ return _activeShops().length > 1; }
+function _mainShopId(){ const a = _shops(); return (a[0] && a[0].id) || 'main'; }
+function _defaultShopId(){ const a = _activeShops(); return (a[0] && a[0].id) || _mainShopId(); }
+function _shopById(id){ return _shops().find(function(s){ return s.id === id; }); }
+function _shopName(id){ const s = _shopById(id || _mainShopId()); return s ? s.name : ''; }
+function qtyIn(item, shopId){ if (!item) return 0; if (!shopId) return item.stockQty || 0; return (item.shopStock || {})[shopId] || 0; }
+function shopQty(item){ return qtyIn(item, _multiShop() ? State.shopId : ''); }   // what the current view should show
+function _inShop(rec){ if (!_multiShop() || !State.shopId) return true; return (rec.shopId || _mainShopId()) === State.shopId; }
+function _shopTag(rec){ return (_multiShop() && !State.shopId) ? ' · ' + esc(_shopName(rec.shopId)) : ''; }
+
+/* Make sure the business has at least one shop and per-shop stock (runs on open; older data goes to the first shop) */
+function _ensureShops(){
+  const db = State.db, s = db.settings;
+  if (!Array.isArray(db.shops) || !db.shops.length)
+    db.shops = [{ id:'main', name:s.businessName || 'Main shop', address:s.address || '', phone:s.phone || '', active:true, createdAt:todayISO() }];
+  const main = db.shops[0];
+  if (s.posToken) main.posToken = s.posToken;                       // the existing staff link keeps working for the first shop
+  db.shops.forEach(function(sh){ if (!sh.posToken) sh.posToken = _randCode(20); });
+  (db.items || []).forEach(function(i){ if (i.trackStock !== false && !i.shopStock) { i.shopStock = {}; i.shopStock[main.id] = i.stockQty || 0; } });
+  let saved = ''; try { saved = localStorage.getItem('bm_shop_' + State.bizUid) || ''; } catch(e) {}
+  if (!_multiShop()) State.shopId = _defaultShopId();
+  else State.shopId = saved === 'all' ? '' : (_activeShops().some(function(x){ return x.id === saved; }) ? saved : _defaultShopId());
+}
+
+/* The one place stock changes. shopId defaults to the shop you are working in */
+function addStockMovement(itemId, type, qty, reference, note, shopId){
+  const item = State.db.items.find(function(i){ return i.id === itemId; }); if (!item) return;
+  const sid = shopId || State.shopId || _defaultShopId();
+  if (!item.shopStock) { item.shopStock = {}; item.shopStock[_mainShopId()] = item.stockQty || 0; }
+  item.shopStock[sid] = (item.shopStock[sid] || 0) + qty;
+  item.stockQty = Object.keys(item.shopStock).reduce(function(a, k){ return a + (+item.shopStock[k] || 0); }, 0);
+  if (!State.db.stockMovements) State.db.stockMovements = [];
+  State.db.stockMovements.unshift({ id:uid(), date:todayISO(), time:new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}),
+    itemId:itemId, itemName:item.name, type:type, qty:qty, reference:reference || 'manual', note:note || '',
+    shopId:sid, balance:item.shopStock[sid], total:item.stockQty });
+  if (State.db.stockMovements.length > 600) State.db.stockMovements.length = 600;
+}
+
+/* ---------- choose shop (top bar) ---------- */
+function _renderShopChip(){
+  const bar = document.querySelector('.topbar'); if (!bar) return;
+  let chip = document.getElementById('shopChip');
+  if (!_multiShop()) { if (chip) chip.style.display = 'none'; return; }
+  if (!chip) {
+    chip = document.createElement('button'); chip.id = 'shopChip'; chip.className = 'shop-chip'; chip.title = 'Choose shop'; chip.onclick = openShopPicker;
+    const biz = bar.querySelector('.biz-chip'); bar.insertBefore(chip, biz);
+  }
+  chip.style.display = '';
+  chip.innerHTML = '<span class="shop-ic">\u{1F3EA}</span><span class="shop-nm">' + esc(State.shopId ? _shopName(State.shopId) : 'All shops') + '</span><span class="biz-caret">\u25BE</span>';
+}
+function openShopPicker(){
+  const rows = [{ id:'', name:'All shops', sub:'Totals across every shop (view only for stock & POS)' }]
+    .concat(_activeShops().map(function(s){ return { id:s.id, name:s.name, sub:s.address || '' }; }));
+  openModal('Choose shop',
+    rows.map(function(r){
+      const cur = (State.shopId || '') === r.id;
+      return '<div class="biz-row' + (cur ? ' cur' : '') + '" onclick="setShop(\'' + r.id + '\')">' +
+        '<span class="biz-row-av">' + (r.id ? esc(r.name[0].toUpperCase()) : '\u2211') + '</span>' +
+        '<span class="biz-row-txt"><b>' + esc(r.name) + '</b><span class="muted">' + esc(r.sub) + '</span></span>' +
+        (cur ? '<span class="pill paid">Open</span>' : '<span class="biz-row-go">\u203A</span>') + '</div>';
+    }).join('') +
+    '<button class="btn ghost" style="width:100%;margin-top:6px" onclick="closeModal();go(\'shops\')">Manage shops</button>',
+    [{label:'Close', cls:'ghost', fn:closeModal}], 'sm');
+}
+function setShop(id){
+  State.shopId = id || '';
+  try { localStorage.setItem('bm_shop_' + State.bizUid, id || 'all'); } catch(e) {}
+  try { posCart = []; posCashier = null; } catch(e) {}
+  closeModal(); refreshChrome();
+  go(State.view === 'shops' ? 'dashboard' : State.view);
+  toast(id ? 'Working in ' + _shopName(id) : 'Showing all shops');
+}
+/* Screens that change stock or sell need one specific shop */
+function _needShop(title){
+  if (!_multiShop() || State.shopId) return '';
+  return '<div class="card pad" style="text-align:center;max-width:460px;margin:20px auto"><b>' + esc(title) + '</b>' +
+    '<p class="muted" style="font-size:13px;margin:6px 0 12px">You are viewing all shops. Choose the shop to work in.</p>' +
+    _activeShops().map(function(s){ return '<button class="btn ghost" style="width:100%;margin-bottom:8px" onclick="setShop(\'' + s.id + '\')">\u{1F3EA} ' + esc(s.name) + '</button>'; }).join('') + '</div>';
+}
+
+/* ---------- Shops screen ---------- */
+function _canAddShop(){
+  if (State.isAdmin || _activeShops().length < 1) return true;
+  const m = moduleMode('multiShop'); return m === 'free' || (m === 'pro' && isPro());
+}
+function viewShops(){
+  const c = document.getElementById('content'), today = todayISO();
+  const shops = _shops();
+  const card = function(s){
+    const items = (State.db.items || []).filter(function(i){ return i.trackStock !== false; });
+    const units = items.reduce(function(a, i){ return a + qtyIn(i, s.id); }, 0);
+    const value = items.reduce(function(a, i){ return a + qtyIn(i, s.id) * (i.costPrice || 0); }, 0);
+    const staff = (State.db.employees || []).filter(function(e){ return e.active !== false && (!e.shopId || e.shopId === s.id); }).length;
+    const sales = (State.db.transactions || []).filter(function(t){ return t.date === today && (t.shopId || _mainShopId()) === s.id; });
+    const salesTotal = sales.reduce(function(a, t){ return a + ((t.totals && t.totals.total) || 0); }, 0);
+    const link = _shopPosUrl(s), closed = s.active === false;
+    return '<div class="card shop-card' + (closed ? ' closed' : '') + '">' +
+      '<div class="between" style="gap:8px;align-items:flex-start"><div style="min-width:0"><b style="font-size:15.5px">' + esc(s.name) + '</b>' +
+        (s.id === _mainShopId() ? ' <span class="pill sent">first shop</span>' : '') + (closed ? ' <span class="pill draft">closed</span>' : '') +
+        '<div class="muted" style="font-size:12.5px;margin-top:2px">' + esc([s.address, s.phone].filter(Boolean).join(' · ') || 'No address') + '</div></div>' +
+        '<button class="iconbtn" title="Edit" onclick="openShopEditor(\'' + s.id + '\')">' + svg('edit') + '</button></div>' +
+      '<div class="shop-stats">' +
+        '<div><span>Stock units</span><b>' + units + '</b></div><div><span>Stock value</span><b>' + money(value) + '</b></div>' +
+        '<div><span>Staff</span><b>' + staff + '</b></div><div><span>Sales today</span><b>' + money(salesTotal) + '</b></div></div>' +
+      (closed ? '' :
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">' +
+          (State.shopId === s.id ? '<span class="pill paid" style="align-self:center">You are working here</span>' : '<button class="btn accent sm" onclick="setShop(\'' + s.id + '\')">Work in this shop</button>') +
+          '<button class="btn ghost sm" onclick="_copyText(\'' + link + '\',\'Staff POS link copied\')">Copy staff POS link</button>' +
+          '<button class="btn ghost sm" onclick="window.open(\'' + link + '\',\'_blank\')">Open POS \u2197</button></div>') +
+    '</div>';
+  };
+  c.innerHTML =
+    '<div class="between" style="margin-bottom:14px;gap:10px;flex-wrap:wrap">' +
+      '<p class="muted" style="font-size:13px;max-width:560px">Each shop has its own stock, POS register, staff POS link and sales. Products, customers and invoices are shared across shops.</p>' +
+      '<button class="btn accent" onclick="openShopEditor()">' + svg('plus') + ' Open a new shop</button></div>' +
+    (_multiShop() ? '<div style="margin-bottom:12px"><button class="btn ghost sm" onclick="openStockTransfer()">\u21C4 Transfer stock between shops</button></div>' : '') +
+    '<div class="shop-grid">' + shops.map(card).join('') + '</div>';
+  renderIcons(c);
+}
+function _shopPosUrl(s){ return location.href.split(/[?#]/)[0].replace(/[^/]*$/, '') + 'pos.html?t=' + encodeURIComponent(s.posToken || ''); }
+function _copyText(t, msg){
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(function(){ toast(msg || 'Copied'); }).catch(function(){ window.prompt('Copy:', t); });
+  else window.prompt('Copy:', t);
+}
+function openShopEditor(id){
+  const s = id ? _shopById(id) : { name:'', address:'', phone:'', active:true };
+  if (!id && !_canAddShop()) { toast('Opening more shops needs Pro'); openUpgrade(); return; }
+  const isMain = id && id === _mainShopId();
+  const stockHere = id ? (State.db.items || []).reduce(function(a, i){ return a + Math.abs(qtyIn(i, id)); }, 0) : 0;
+  openModal(id ? 'Edit shop' : 'Open a new shop',
+    '<div class="field"><label>Shop name *</label><input id="sh_name" value="' + esc(s.name) + '" placeholder="e.g. Hulhumale branch"></div>' +
+    '<div class="field"><label>Address</label><input id="sh_addr" value="' + esc(s.address || '') + '" placeholder="Street, island"></div>' +
+    '<div class="field"><label>Phone</label><input id="sh_phone" value="' + esc(s.phone || '') + '"></div>' +
+    (id ? '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">' +
+        '<button class="btn ghost sm" onclick="resetShopLink(\'' + id + '\')">Reset staff POS link</button>' +
+        (isMain ? '' : (s.active === false
+          ? '<button class="btn ghost sm" onclick="setShopActive(\'' + id + '\',true)">Reopen shop</button>'
+          : '<button class="btn ghost sm" style="color:var(--danger)" onclick="setShopActive(\'' + id + '\',false)"' + (stockHere ? ' disabled title="Transfer the stock out first"' : '') + '>Close shop</button>')) +
+      '</div>' + (stockHere && !isMain && s.active !== false ? '<p class="muted" style="font-size:12px;margin-top:6px">To close this shop, first transfer its stock to another shop.</p>' : '') : ''),
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:id ? 'Save' : 'Open shop', cls:'accent', fn:function(){ saveShop(id); }}], 'sm');
+}
+function saveShop(id){
+  const name = val('sh_name').trim(); if (!name) return toast('Enter the shop name');
+  if (id) { const s = _shopById(id); s.name = name; s.address = val('sh_addr'); s.phone = val('sh_phone'); }
+  else {
+    if (!_canAddShop()) { closeModal(); openUpgrade(); return; }
+    const s = { id:'s_' + _randCode(10), name:name, address:val('sh_addr'), phone:val('sh_phone'), active:true, posToken:_randCode(20), createdAt:todayISO() };
+    State.db.shops.push(s);
+    (State.db.items || []).forEach(function(i){ if (i.trackStock !== false) { i.shopStock = i.shopStock || {}; i.shopStock[s.id] = 0; } });
+    toast(name + ' opened — it starts with no stock. Use Transfer or Receive stock to fill it.');
+  }
+  persist(); closeModal(); refreshChrome(); viewShops();
+}
+function setShopActive(id, active){
+  const s = _shopById(id); if (!s) return;
+  if (!active && State.shopId === id) State.shopId = _activeShops().filter(function(x){ return x.id !== id; })[0].id;
+  s.active = active;
+  if (!active && s.posToken) _fdb.collection('pos_portals').doc(s.posToken).delete().catch(function(){});
+  persist(); closeModal(); refreshChrome(); viewShops(); toast(active ? 'Shop reopened' : 'Shop closed — its staff POS link no longer works');
+}
+function resetShopLink(id){
+  const s = _shopById(id); if (!s) return;
+  confirmDel('Reset the staff POS link for ' + esc(s.name) + '? Staff will need the new link.', function(){
+    const old = s.posToken; s.posToken = _randCode(20);
+    if (id === _mainShopId()) State.db.settings.posToken = s.posToken;
+    if (old) _fdb.collection('pos_portals').doc(old).delete().catch(function(){});
+    persist(); closeModal(); viewShops(); toast('New staff POS link created');
+  });
+}
+/* ---------- move stock between shops ---------- */
+function openStockTransfer(itemId){
+  if (!_multiShop()) return toast('Open a second shop first');
+  const items = (State.db.items || []).filter(function(i){ return i.trackStock !== false; });
+  const shops = _activeShops(), from = State.shopId || shops[0].id, to = (shops.find(function(s){ return s.id !== from; }) || shops[0]).id;
+  const opts = function(sel){ return shops.map(function(s){ return '<option value="' + s.id + '"' + (s.id === sel ? ' selected' : '') + '>' + esc(s.name) + '</option>'; }).join(''); };
+  openModal('Transfer stock',
+    '<div class="field"><label>Product *</label><select id="tr_item" onchange="_trUpdate()">' + items.map(function(i){ return '<option value="' + i.id + '"' + (i.id === itemId ? ' selected' : '') + '>' + esc(i.name) + '</option>'; }).join('') + '</select></div>' +
+    '<div class="fgrid"><div class="field"><label>From shop</label><select id="tr_from" onchange="_trUpdate()">' + opts(from) + '</select></div>' +
+    '<div class="field"><label>To shop</label><select id="tr_to">' + opts(to) + '</select></div></div>' +
+    '<div class="fgrid"><div class="field"><label>Quantity *</label><input id="tr_qty" type="number" min="1" step="1"></div>' +
+    '<div class="field"><label>Available in “from” shop</label><div id="tr_avail" class="stat-box">—</div></div></div>' +
+    '<div class="field"><label>Note</label><input id="tr_note" placeholder="Optional"></div>',
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:'Transfer', cls:'accent', fn:saveStockTransfer}], 'sm');
+  setTimeout(_trUpdate, 30);
+}
+function _trUpdate(){
+  const it = State.db.items.find(function(i){ return i.id === val('tr_item'); }), el = document.getElementById('tr_avail');
+  if (el && it) el.textContent = qtyIn(it, val('tr_from')) + ' ' + (it.unit || 'pc');
+}
+function saveStockTransfer(){
+  const id = val('tr_item'), from = val('tr_from'), to = val('tr_to'), q = +val('tr_qty');
+  const it = State.db.items.find(function(i){ return i.id === id; });
+  if (!it) return toast('Choose a product');
+  if (from === to) return toast('Choose two different shops');
+  if (!q || q <= 0) return toast('Enter a quantity');
+  if (q > qtyIn(it, from)) return toast('Only ' + qtyIn(it, from) + ' available in ' + _shopName(from));
+  const ref = 'TR-' + Date.now().toString(36).toUpperCase(), note = val('tr_note');
+  addStockMovement(id, 'transfer', -q, ref, 'To ' + _shopName(to) + (note ? ' — ' + note : ''), from);
+  addStockMovement(id, 'transfer', q, ref, 'From ' + _shopName(from) + (note ? ' — ' + note : ''), to);
+  persist(); closeModal(); toast(q + ' ' + (it.unit || 'pc') + ' moved to ' + _shopName(to));
+  if (State.view === 'stock') viewStock(); else if (State.view === 'shops') viewShops();
+}
+
+/* ---------- staff POS links: one per shop (pos_portals/{shop.posToken}) ---------- */
+function syncPosPortal(uid){
+  const db = State.db, s = db && db.settings;
+  if (!s || !uid || !Array.isArray(db.shops)) return;
+  _activeShops().forEach(function(shop){
+    const tok = shop.posToken; if (!tok) return;
+    const data = {
+      businessUid: uid, shopId: shop.id, shopName: shop.name,
+      businessName: s.businessName || '', logo: s.logo || '',
+      currencySymbol: s.currencySymbol || 'Rf', taxLabel: s.taxLabel || 'GST', taxRate: +s.taxRate || 0,
+      posPrefix: s.posPrefix || 'TXN-', updatedAt: new Date().toISOString(),
+      employees: (db.employees || []).filter(function(e){ return e && e.active !== false && (!e.shopId || e.shopId === shop.id); }).map(function(e){
+        return { id:e.id, name:e.name || '', role:e.role || 'cashier', pinHash: e.pin ? _sha256hex(tok + ':' + e.id + ':' + e.pin) : '' };
+      }),
+      items: (db.items || []).filter(function(i){ return i && i.name; }).map(function(i){
+        return { id:i.id, name:i.name, sku:i.sku || '', barcode:i.barcode || '', unit:i.unit || 'pc',
+          unitPrice:+i.unitPrice || 0, taxable:i.taxable !== false, trackStock:i.trackStock !== false,
+          stockQty:qtyIn(i, shop.id), reorderLevel:i.reorderLevel || 0 };
+      })
+    };
+    _fdb.collection('pos_portals').doc(tok).set(data).catch(function(e){ console.warn('POS portal sync:', e.message); });
+  });
+}
+function posStaffUrl(){
+  const shop = _shopById(State.shopId) || _activeShops()[0];
+  if (shop && shop.posToken) return _shopPosUrl(shop);
+  const s = (State.db && State.db.settings) || {};
+  return location.href.split(/[?#]/)[0].replace(/[^/]*$/, '') + 'pos.html?t=' + encodeURIComponent(s.posToken || '');
+}
+
+/* ============================================================
+   STAFF MANAGEMENT — Staff · Attendance · Payroll · Advances
+   Pay details & advances : businesses/{biz}/hr/pay            (owner + team admins only)
+   Attendance             : businesses/{biz}/attendance/{YYYY-MM}
+   Payroll runs           : businesses/{biz}/payroll/{YYYY-MM}  (owner + team admins only)
+   ============================================================ */
+var _empTab = 'staff', _attView = 'day', _attDate = '', _attMonth = '', _payMonth = '';
+var _hr = null, _att = {}, _payRun = null, _attSaveT = null;
+const ATT_STATUS = [
+  { k:'P',  label:'Present',  cls:'att-p' }, { k:'L',  label:'Late',    cls:'att-l' }, { k:'H', label:'Half day', cls:'att-h' },
+  { k:'A',  label:'Absent',   cls:'att-a' }, { k:'LV', label:'Leave',   cls:'att-lv' }, { k:'O', label:'Off',      cls:'att-o' } ];
+const LEAVE_TYPES = [['annual','Annual'],['sick','Sick'],['unpaid','Unpaid'],['other','Other']];
+
+function _canSeePay(){ return !State.isMember || State.memberRole === 'admin'; }
+function _monthOf(d){ return String(d).slice(0, 7); }
+function _monthLabel(m){ const d = new Date(m + '-01T12:00:00'); return d.toLocaleDateString(undefined, { month:'long', year:'numeric' }); }
+function _daysInMonth(m){ const p = m.split('-'); return new Date(+p[0], +p[1], 0).getDate(); }
+function _r2(n){ return Math.round((+n || 0) * 100) / 100; }
+function _bizCol(name){ return _fdb.collection('businesses').doc(_bizUid()).collection(name); }
+
+/* ---------- storage ---------- */
+function _hrDefaults(){ return { staff:{}, advances:[], settings:{ workDays:26, pensionEmp:7, pensionEr:7, annualLeave:30, lateAfter:'' } }; }
+async function _loadHR(){
+  if (_hr && _hr._biz === _bizUid()) return _hr;
+  const base = _hrDefaults();
+  if (!_canSeePay()) { _hr = Object.assign(base, { _biz:_bizUid() }); return _hr; }
+  try { const d = await _bizCol('hr').doc('pay').get(); if (d.exists) { const x = d.data(); base.staff = x.staff || {}; base.advances = x.advances || []; base.settings = Object.assign(base.settings, x.settings || {}); } }
+  catch(e) { console.warn('hr load:', e.message); }
+  _hr = Object.assign(base, { _biz:_bizUid() }); return _hr;
+}
+async function _saveHR(){
+  if (!_hr || !_canSeePay()) return;
+  try { await _bizCol('hr').doc('pay').set({ staff:_hr.staff, advances:_hr.advances, settings:_hr.settings, updatedAt:new Date().toISOString() }); }
+  catch(e) { toast('Could not save pay details: ' + e.message); }
+}
+async function _loadAtt(month){
+  const key = _bizUid() + '|' + month;
+  if (_att[key]) return _att[key];
+  let doc = { month:month, days:{} };
+  try { const d = await _bizCol('attendance').doc(month).get(); if (d.exists) doc = Object.assign(doc, d.data()); } catch(e) { console.warn('attendance load:', e.message); }
+  _att[key] = doc; return doc;
+}
+async function _saveAtt(month){
+  const doc = _att[_bizUid() + '|' + month]; if (!doc) return;
+  try { await _bizCol('attendance').doc(month).set({ month:month, days:doc.days, updatedAt:new Date().toISOString() }); }
+  catch(e) { toast('Could not save attendance: ' + e.message); }
+}
+function _staffList(){
+  return (State.db.employees || []).filter(function(e){ return e.active !== false && (!_multiShop() || !State.shopId || !e.shopId || e.shopId === State.shopId); });
+}
+
+/* ---------- module shell ---------- */
+async function viewEmployees(){
+  if (!State.db) { toast('Loading… please wait'); return; }
+  const c = document.getElementById('content');
+  const tabs = [['staff','Staff'],['attendance','Attendance']].concat(_canSeePay() ? [['payroll','Payroll'],['advances','Advances']] : []);
+  if (!tabs.some(function(t){ return t[0] === _empTab; })) _empTab = 'staff';
+  c.innerHTML = '<div class="tabs" style="margin-bottom:14px">' + tabs.map(function(t){
+      return '<button class="' + (_empTab === t[0] ? 'active' : '') + '" onclick="_empTab=\'' + t[0] + '\';viewEmployees()">' + t[1] + '</button>'; }).join('') +
+    '</div><div id="empPanel"><div class="muted" style="padding:12px">Loading…</div></div>';
+  await _loadHR();
+  if (State.view !== 'employees') return;
+  const lockKey = _empTab === 'attendance' ? 'attendance' : (_empTab === 'payroll' || _empTab === 'advances') ? 'payroll' : '';
+  if (lockKey && (moduleOff(lockKey) || featureLocked(lockKey))) {
+    document.getElementById('empPanel').innerHTML = '<div class="locked-view"><div class="ic">' + svg('lock', 28) + '</div><h2 style="font-size:20px">' +
+      (lockKey === 'payroll' ? 'Payroll' : 'Attendance') + ' is a Pro feature</h2><p class="muted" style="margin:10px 0 20px">Upgrade to Pro to use it.</p>' +
+      '<button class="btn amber" onclick="openUpgrade()">See Pro plans</button></div>';
+    renderIcons(document.getElementById('empPanel')); return;
+  }
+  if (_empTab === 'staff') renderStaff();
+  else if (_empTab === 'attendance') renderAttendance();
+  else if (_empTab === 'payroll') renderPayroll();
+  else renderAdvances();
+}
+
+/* ---------- Staff ---------- */
+function renderStaff(){
+  const p = document.getElementById('empPanel'); if (!p) return;
+  const emps = State.db.employees || [];
+  const atLimit = featureLocked('multiEmployee') && emps.length >= EMP_FREE_LIMIT;
+  const pay = _canSeePay();
+  p.innerHTML =
+    '<div class="between" style="margin-bottom:14px;gap:10px;flex-wrap:wrap">' +
+      '<p class="muted" style="font-size:13px;max-width:560px">Staff records, POS sign-in PINs' + (pay ? ', and pay details used for payroll' : '') + '.</p>' +
+      '<button class="btn accent" onclick="openEmpEditor()"' + (atLimit ? ' disabled title="Upgrade to Pro to add more staff"' : '') + '>' + svg('plus') + ' Add staff</button></div>' +
+    (atLimit ? '<div class="card pad" style="background:var(--amber-soft);border-color:var(--amber);margin-bottom:14px"><b>Staff limit reached (' + EMP_FREE_LIMIT + ').</b> <a class="linkish" onclick="openUpgrade()">Upgrade to Pro</a> for unlimited staff.</div>' : '') +
+    (emps.length ? '<div class="tbl"><table><thead><tr><th>Name</th><th>Position</th>' + (_multiShop() ? '<th>Shop</th>' : '') + '<th>Phone</th><th>POS</th>' + (pay ? '<th class="right">Pay</th>' : '') + '<th>Status</th><th></th></tr></thead><tbody>' +
+      emps.map(function(e){
+        const ps = (_hr.staff || {})[e.id] || {};
+        const payTxt = ps.payBasis === 'daily' ? (ps.dailyRate ? money(ps.dailyRate) + '/day' : '—') : (ps.basic ? money(ps.basic) + '/mo' : '—');
+        return '<tr><td><div class="row" style="gap:9px"><div class="emp-avt" style="width:32px;height:32px;font-size:14px;flex-shrink:0">' + esc((e.name || '?')[0].toUpperCase()) + '</div><b>' + esc(e.name) + '</b></div></td>' +
+          '<td>' + esc(e.position || '—') + '</td>' +
+          (_multiShop() ? '<td>' + (e.shopId ? esc(_shopName(e.shopId)) : '<span class="muted">All shops</span>') + '</td>' : '') +
+          '<td class="muted">' + esc(e.phone || '—') + '</td>' +
+          '<td><span class="pill ' + (e.role === 'manager' ? 'sent' : 'draft') + '">' + esc(e.role || 'cashier') + '</span>' + (e.pin ? ' <span class="muted" style="font-size:11px">PIN set</span>' : '') + '</td>' +
+          (pay ? '<td class="right mono">' + payTxt + '</td>' : '') +
+          '<td><span class="pill ' + (e.active !== false ? 'paid' : 'draft') + '">' + (e.active !== false ? 'Active' : 'Inactive') + '</span></td>' +
+          '<td><div class="rowacts"><button class="iconbtn" onclick="openEmpEditor(\'' + e.id + '\')">' + svg('edit') + '</button><button class="iconbtn" onclick="delEmployee(\'' + e.id + '\')">' + svg('trash') + '</button></div></td></tr>';
+      }).join('') + '</tbody></table></div>'
+    : emptyBox('No staff yet', 'Add staff to track attendance, run payroll and let them sign in to the POS with a PIN.'));
+  renderIcons(p);
+}
+async function openEmpEditor(id){
+  await _loadHR();
+  const e = id ? (State.db.employees || []).find(function(x){ return x.id === id; }) : { name:'', role:'cashier', pin:'', active:true, nationality:'local' };
+  const ps = (id && _hr.staff[id]) || { payBasis:'monthly', basic:0, allowance:0, allowanceLabel:'Allowance', pension:(e.nationality || 'local') === 'local' };
+  const pay = _canSeePay();
+  const sel = function(idv, pairs, cur){ return '<select id="' + idv + '">' + pairs.map(function(p){ return '<option value="' + p[0] + '"' + (String(cur) === String(p[0]) ? ' selected' : '') + '>' + p[1] + '</option>'; }).join('') + '</select>'; };
+  openModal(id ? 'Edit staff' : 'Add staff',
+    '<div class="sec-h">Details</div><div class="fgrid">' +
+      '<div class="field"><label>Full name *</label><input id="em_name" value="' + esc(e.name || '') + '"></div>' +
+      '<div class="field"><label>Position / job title</label><input id="em_pos" value="' + esc(e.position || '') + '" placeholder="e.g. Cashier, Store keeper"></div>' +
+      '<div class="field"><label>Phone</label><input id="em_phone" type="tel" value="' + esc(e.phone || '') + '"></div>' +
+      '<div class="field"><label>ID card / passport no.</label><input id="em_idno" value="' + esc(e.idNo || '') + '"></div>' +
+      '<div class="field"><label>Nationality</label>' + sel('em_nat', [['local','Maldivian'],['expat','Expatriate']], e.nationality || 'local') + '</div>' +
+      '<div class="field"><label>Joined on</label><input id="em_join" type="date" value="' + esc(e.joinDate || '') + '"></div>' +
+      (_multiShop() ? '<div class="field"><label>Works at</label>' + sel('em_shop', [['','All shops']].concat(_activeShops().map(function(s){ return [s.id, esc(s.name)]; })), e.shopId || '') + '</div>' : '') +
+    '</div>' +
+    '<div class="sec-h">POS access</div><div class="fgrid">' +
+      '<div class="field"><label>POS role</label>' + sel('em_role', [['cashier','Cashier'],['manager','Manager']], e.role || 'cashier') + '</div>' +
+      '<div class="field"><label>4-digit PIN</label><input id="em_pin" type="password" maxlength="4" inputmode="numeric" placeholder="' + (e.pin ? 'Leave blank to keep' : 'Optional') + '"></div>' +
+      '<div class="field"><label>Status</label>' + sel('em_act', [['1','Active'],['0','Inactive']], e.active !== false ? '1' : '0') + '</div>' +
+    '</div>' +
+    (pay ? '<div class="sec-h">Pay</div><div class="fgrid">' +
+      '<div class="field"><label>Paid by</label>' + sel('em_basis', [['monthly','Monthly salary'],['daily','Daily rate (days worked)']], ps.payBasis || 'monthly') + '</div>' +
+      '<div class="field"><label>Basic salary / month</label><input id="em_basic" type="number" step="0.01" value="' + (ps.basic || '') + '"></div>' +
+      '<div class="field"><label>Daily rate</label><input id="em_daily" type="number" step="0.01" value="' + (ps.dailyRate || '') + '"></div>' +
+      '<div class="field"><label>Fixed allowance / month</label><input id="em_allow" type="number" step="0.01" value="' + (ps.allowance || '') + '"></div>' +
+      '<div class="field"><label>Allowance name</label><input id="em_allowlbl" value="' + esc(ps.allowanceLabel || 'Allowance') + '"></div>' +
+      '<div class="field"><label>Pension (MRPS)</label>' + sel('em_pension', [['1','Yes — deduct ' + _hr.settings.pensionEmp + '%'],['0','No']], ps.pension === false ? '0' : (ps.pension ? '1' : ((e.nationality || 'local') === 'local' ? '1' : '0'))) + '</div>' +
+    '</div><p class="muted" style="font-size:12px">Pension: Maldivian staff contribute 7% of basic salary, and the employer pays 7% (rates can be changed in Payroll settings).</p>' : ''),
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:id ? 'Save' : 'Add staff', cls:'accent', fn:function(){ saveEmployee(id); }}], 'lg');
+}
+async function saveEmployee(id){
+  const name = val('em_name').trim(); if (!name) return toast('Name is required');
+  const pin = val('em_pin'); if (pin && !/^\d{4}$/.test(pin)) return toast('PIN must be exactly 4 digits');
+  if (!State.db.employees) State.db.employees = [];
+  const old = id ? State.db.employees.find(function(x){ return x.id === id; }) : null;
+  const rec = Object.assign({}, old || {}, { id:id || uid(), name:name, position:val('em_pos'), phone:val('em_phone'), idNo:val('em_idno'),
+    nationality:val('em_nat') || 'local', joinDate:val('em_join'), shopId:(document.getElementById('em_shop') ? val('em_shop') : (old && old.shopId) || ''),
+    role:val('em_role') || 'cashier', pin:pin || (old ? old.pin : ''), active:val('em_act') === '1' });
+  if (old) State.db.employees[State.db.employees.indexOf(old)] = rec; else State.db.employees.push(rec);
+  persist();
+  if (_canSeePay() && document.getElementById('em_basis')) {
+    _hr.staff[rec.id] = { payBasis:val('em_basis'), basic:+val('em_basic') || 0, dailyRate:+val('em_daily') || 0, allowance:+val('em_allow') || 0,
+      allowanceLabel:val('em_allowlbl') || 'Allowance', pension:val('em_pension') === '1' };
+    await _saveHR();
+  }
+  closeModal(); renderStaff(); toast(id ? 'Staff updated' : 'Staff added');
+}
+function setEmpActive(id, active){ const e = (State.db.employees || []).find(function(x){ return x.id === id; }); if (e) { e.active = active; persist(); } }
+function delEmployee(id){
+  confirmDel('Delete this staff member? Their past attendance and payroll records are kept.', async function(){
+    State.db.employees = (State.db.employees || []).filter(function(e){ return e.id !== id; });
+    persist(); if (_hr && _hr.staff[id]) { delete _hr.staff[id]; await _saveHR(); }
+    renderStaff(); toast('Staff removed');
+  });
+}
+
+/* ---------- Attendance ---------- */
+async function renderAttendance(){
+  const p = document.getElementById('empPanel'); if (!p) return;
+  if (!_attDate) _attDate = _localISO();
+  if (!_attMonth) _attMonth = _monthOf(_attDate);
+  const head = '<div class="tabs" style="margin-bottom:12px">' +
+    '<button class="' + (_attView === 'day' ? 'active' : '') + '" onclick="_attView=\'day\';renderAttendance()">Daily register</button>' +
+    '<button class="' + (_attView === 'month' ? 'active' : '') + '" onclick="_attView=\'month\';renderAttendance()">Monthly summary</button></div>';
+  const staff = _staffList();
+  if (!staff.length) { p.innerHTML = head + emptyBox('No active staff' + (State.shopId && _multiShop() ? ' in this shop' : ''), 'Add staff in the Staff tab first.'); return; }
+  if (_attView === 'day') {
+    const doc = await _loadAtt(_monthOf(_attDate)); const day = doc.days[_attDate] || {};
+    p.innerHTML = head +
+      '<div class="between" style="gap:10px;flex-wrap:wrap;margin-bottom:12px">' +
+        '<div style="display:flex;gap:8px;align-items:center"><input type="date" id="att_date" value="' + _attDate + '" onchange="_attDate=this.value;renderAttendance()" style="padding:8px 10px;border:1px solid var(--line);border-radius:9px">' +
+        '<span class="muted" style="font-size:12.5px">' + new Date(_attDate + 'T12:00:00').toLocaleDateString(undefined, { weekday:'long' }) + '</span></div>' +
+        '<button class="btn ghost sm" onclick="attMarkAll(\'P\')">Mark everyone present</button></div>' +
+      '<div class="att-list">' + staff.map(function(e){
+        const r = day[e.id] || {};
+        return '<div class="card att-card"><div class="between" style="gap:8px"><b>' + esc(e.name) + '</b><span class="muted" style="font-size:12px">' + esc(e.position || '') + '</span></div>' +
+          '<div class="att-btns">' + ATT_STATUS.map(function(s){
+            return '<button class="att-b ' + s.cls + (r.s === s.k ? ' on' : '') + '" onclick="attSet(\'' + e.id + '\',\'s\',\'' + s.k + '\')">' + s.label + '</button>'; }).join('') + '</div>' +
+          '<div class="att-row">' +
+            (r.s === 'LV' ? '<label>Leave<select onchange="attSet(\'' + e.id + '\',\'lt\',this.value)">' + LEAVE_TYPES.map(function(t){ return '<option value="' + t[0] + '"' + ((r.lt || 'annual') === t[0] ? ' selected' : '') + '>' + t[1] + '</option>'; }).join('') + '</select></label>' : '') +
+            '<label>In<input type="time" value="' + (r.in || '') + '" onchange="attSet(\'' + e.id + '\',\'in\',this.value)"></label>' +
+            '<label>Out<input type="time" value="' + (r.out || '') + '" onchange="attSet(\'' + e.id + '\',\'out\',this.value)"></label>' +
+            '<label class="grow">Note<input value="' + esc(r.note || '') + '" onchange="attSet(\'' + e.id + '\',\'note\',this.value)"></label>' +
+          '</div></div>';
+      }).join('') + '</div>' +
+      '<p class="muted" style="font-size:12px;margin-top:8px">Changes save automatically. Staff can also clock in and out from the staff POS link.</p>';
+  } else {
+    const doc = await _loadAtt(_attMonth), year = _attMonth.slice(0, 4);
+    const yearDocs = await Promise.all(Array.from({ length:+_attMonth.slice(5) }, function(_, i){ return _loadAtt(year + '-' + String(i + 1).padStart(2, '0')); }));
+    const sum = _attSummary(doc, staff);
+    const annualUsed = {}; yearDocs.forEach(function(d){ Object.values(d.days || {}).forEach(function(day){ Object.keys(day).forEach(function(eid){ if (day[eid].s === 'LV' && (day[eid].lt || 'annual') === 'annual') annualUsed[eid] = (annualUsed[eid] || 0) + 1; }); }); });
+    p.innerHTML = head +
+      '<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px"><input type="month" value="' + _attMonth + '" onchange="_attMonth=this.value;renderAttendance()" style="padding:8px 10px;border:1px solid var(--line);border-radius:9px"></div>' +
+      '<div class="tbl"><table><thead><tr><th>Staff</th><th class="right">Present</th><th class="right">Late</th><th class="right">Half day</th><th class="right">Absent</th><th class="right">Leave</th><th class="right">Off</th><th class="right">Hours</th><th class="right">Annual leave ' + year + '</th></tr></thead><tbody>' +
+      staff.map(function(e){ const s = sum[e.id];
+        return '<tr><td><b>' + esc(e.name) + '</b></td><td class="right">' + s.P + '</td><td class="right">' + s.L + '</td><td class="right">' + s.H + '</td>' +
+          '<td class="right"' + (s.A ? ' style="color:var(--danger);font-weight:700"' : '') + '>' + s.A + '</td>' +
+          '<td class="right"><span>' + s.LV + (s.LV ? ' <span class="muted" style="font-size:11px">(' + Object.keys(s.lt).map(function(k){ return s.lt[k] + ' ' + k; }).join(', ') + ')</span>' : '') + '</span></td>' +
+          '<td class="right">' + s.O + '</td><td class="right mono">' + s.hours.toFixed(1) + '</td>' +
+          '<td class="right">' + (annualUsed[e.id] || 0) + ' / ' + _hr.settings.annualLeave + '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+}
+function _attSummary(doc, staff){
+  const out = {};
+  staff.forEach(function(e){ out[e.id] = { P:0, L:0, H:0, A:0, LV:0, O:0, lt:{}, hours:0, unpaidLeave:0 }; });
+  Object.keys(doc.days || {}).forEach(function(date){
+    const day = doc.days[date];
+    Object.keys(day).forEach(function(eid){
+      const r = day[eid], s = out[eid]; if (!s || !r.s) return;
+      s[r.s] = (s[r.s] || 0) + 1;
+      if (r.s === 'LV') { const t = r.lt || 'annual'; s.lt[t] = (s.lt[t] || 0) + 1; if (t === 'unpaid') s.unpaidLeave++; }
+      if (r.in && r.out) { const a = r.in.split(':'), b = r.out.split(':'); const h = ((+b[0] * 60 + +b[1]) - (+a[0] * 60 + +a[1])) / 60; if (h > 0) s.hours += h; }
+    });
+  });
+  return out;
+}
+async function attSet(empId, field, value){
+  const m = _monthOf(_attDate), doc = await _loadAtt(m);
+  doc.days[_attDate] = doc.days[_attDate] || {};
+  const r = doc.days[_attDate][empId] = doc.days[_attDate][empId] || {};
+  if (field === 's' && r.s === value) delete r.s; else r[field] = value;
+  if (field === 's' && value === 'LV' && !r.lt) r.lt = 'annual';
+  clearTimeout(_attSaveT); _attSaveT = setTimeout(function(){ _saveAtt(m); }, 500);
+  if (field === 's') renderAttendance();
+}
+async function attMarkAll(code){
+  const m = _monthOf(_attDate), doc = await _loadAtt(m);
+  doc.days[_attDate] = doc.days[_attDate] || {};
+  _staffList().forEach(function(e){ const r = doc.days[_attDate][e.id] = doc.days[_attDate][e.id] || {}; if (!r.s) r.s = code; });
+  await _saveAtt(m); renderAttendance(); toast('Everyone without a status marked present');
+}
+/* Clock in / out from the staff POS link (arrives through the POS queue) */
+async function _applyClocks(clocks){
+  const byMonth = {};
+  clocks.forEach(function(c){ (byMonth[_monthOf(c.date)] = byMonth[_monthOf(c.date)] || []).push(c); });
+  const hr = await _loadHR(), lateAfter = (hr.settings || {}).lateAfter || '';
+  for (const m of Object.keys(byMonth)) {
+    const doc = await _loadAtt(m);
+    byMonth[m].forEach(function(c){
+      doc.days[c.date] = doc.days[c.date] || {};
+      const r = doc.days[c.date][c.empId] = doc.days[c.date][c.empId] || {};
+      if (c.type === 'in') { if (!r.in || c.time < r.in) r.in = c.time; if (!r.s || r.s === 'A') r.s = (lateAfter && c.time > lateAfter) ? 'L' : 'P'; }
+      else { if (!r.out || c.time > r.out) r.out = c.time; if (!r.s) r.s = 'P'; }
+    });
+    await _saveAtt(m);
+  }
+}
+
+/* ---------- Payroll ---------- */
+function _advanceDue(empId){
+  const list = (_hr.advances || []).filter(function(a){ return a.empId === empId && (a.amount - (a.repaid || 0)) > 0.004; })
+    .sort(function(a, b){ return String(a.date).localeCompare(String(b.date)); });
+  const detail = []; let total = 0;
+  list.forEach(function(a){ const due = Math.min(a.installment || a.amount, a.amount - (a.repaid || 0)); if (due > 0) { detail.push({ id:a.id, amt:_r2(due) }); total += due; } });
+  return { total:_r2(total), detail:detail };
+}
+function _calcLine(e, attSum, keep){
+  const ps = _hr.staff[e.id] || {}, set = _hr.settings, s = attSum[e.id] || { P:0, L:0, H:0, A:0, LV:0, O:0, unpaidLeave:0 };
+  const workDays = +set.workDays || 26;
+  let basic, absence = 0;
+  if (ps.payBasis === 'daily') basic = _r2((ps.dailyRate || 0) * (s.P + s.L + 0.5 * s.H + (s.LV - s.unpaidLeave)));
+  else { basic = +ps.basic || 0; absence = _r2(basic / workDays * (s.A + s.unpaidLeave + 0.5 * s.H)); }
+  const adv = _advanceDue(e.id);
+  const pensionBase = ps.payBasis === 'daily' ? basic : (+ps.basic || 0);
+  const l = Object.assign({ empId:e.id, name:e.name, position:e.position || '', basis:ps.payBasis || 'monthly', basic:basic, allowance:+ps.allowance || 0,
+    allowanceLabel:ps.allowanceLabel || 'Allowance', overtime:0, bonus:0, otherDed:0, absence:absence,
+    daysAbsent:s.A + s.unpaidLeave + 0.5 * s.H, pension:ps.pension !== false && !!ps.pension, advance:adv.total, advDetail:adv.detail }, keep || {});
+  l.pensionEmp = l.pension ? _r2(pensionBase * (+set.pensionEmp || 0) / 100) : 0;
+  l.pensionEr  = l.pension ? _r2(pensionBase * (+set.pensionEr || 0) / 100) : 0;
+  l.gross = _r2(l.basic + l.allowance + (+l.overtime || 0) + (+l.bonus || 0) - l.absence);
+  // never take more for advances than the pay can cover; the rest is deducted in later months
+  const room = Math.max(0, _r2(l.gross - l.pensionEmp - (+l.otherDed || 0)));
+  if (l.advance > room) {
+    let left = room; l.advDetail = (l.advDetail || []).map(function(d){ const amt = _r2(Math.min(d.amt, left)); left = _r2(left - amt); return { id:d.id, amt:amt }; }).filter(function(d){ return d.amt > 0; });
+    l.advance = _r2(room);
+  }
+  l.net = _r2(l.gross - l.pensionEmp - l.advance - (+l.otherDed || 0));
+  return l;
+}
+async function renderPayroll(){
+  const p = document.getElementById('empPanel'); if (!p) return;
+  if (!_payMonth) _payMonth = _localISO().slice(0, 7);
+  if (!_payRun || _payRun._key !== _bizUid() + '|' + _payMonth) {
+    let run = null;
+    try { const d = await _bizCol('payroll').doc(_payMonth).get(); if (d.exists) run = d.data(); } catch(e) { console.warn('payroll load:', e.message); }
+    _payRun = run ? Object.assign(run, { _key:_bizUid() + '|' + _payMonth, _saved:true }) : null;
+  }
+  const r = _payRun, paid = r && r.status === 'paid', set = _hr.settings;
+  const top = '<div class="between" style="gap:10px;flex-wrap:wrap;margin-bottom:12px">' +
+    '<div style="display:flex;gap:8px;align-items:center"><input type="month" value="' + _payMonth + '" onchange="_payMonth=this.value;_payRun=null;renderPayroll()" style="padding:8px 10px;border:1px solid var(--line);border-radius:9px">' +
+    (r ? '<span class="pill ' + (paid ? 'paid' : 'draft') + '">' + (paid ? 'Paid ' + fmtDate(r.paidDate) : (r._saved ? 'Draft saved' : 'Not saved')) + '</span>' : '') + '</div>' +
+    '<button class="btn ghost sm" onclick="openPayrollSettings()">Payroll settings</button></div>';
+  if (!r) {
+    p.innerHTML = top + '<div class="card pad" style="text-align:center"><b>No payroll for ' + _monthLabel(_payMonth) + ' yet</b>' +
+      '<p class="muted" style="font-size:13px;margin:6px 0 12px">Payroll uses each staff member’s pay details and this month’s attendance (absences and unpaid leave are deducted' + (set.pensionEmp ? ', pension ' + set.pensionEmp + '% + employer ' + set.pensionEr + '%' : '') + ', plus advance repayments).</p>' +
+      '<button class="btn accent" onclick="preparePayroll()">Prepare payroll</button></div>';
+    return;
+  }
+  const L = r.lines || [], tot = _payTotals(L);
+  const inp = function(i, f){ return paid ? money(L[i][f] || 0) : '<input class="pay-in" type="number" step="0.01" value="' + (L[i][f] || 0) + '" onchange="payEdit(' + i + ',\'' + f + '\',this.value)">'; };
+  p.innerHTML = top +
+    '<div class="grid kpis" style="margin-bottom:12px">' +
+      '<div class="card kpi"><div class="lbl">Net pay</div><div class="val" style="font-size:20px">' + money(tot.net) + '</div><div class="sub muted">' + L.length + ' staff</div></div>' +
+      '<div class="card kpi"><div class="lbl">Gross</div><div class="val" style="font-size:20px">' + money(tot.gross) + '</div><div class="sub muted">after absence deductions</div></div>' +
+      '<div class="card kpi"><div class="lbl">Pension (MRPS)</div><div class="val" style="font-size:20px">' + money(tot.pensionEmp + tot.pensionEr) + '</div><div class="sub muted">staff ' + money(tot.pensionEmp) + ' · employer ' + money(tot.pensionEr) + '</div></div>' +
+      '<div class="card kpi"><div class="lbl">Total cost</div><div class="val" style="font-size:20px">' + money(tot.gross + tot.pensionEr) + '</div><div class="sub muted">gross + employer pension</div></div></div>' +
+    '<div class="tbl"><table><thead><tr><th>Staff</th><th class="right">Pay</th><th class="right">Overtime</th><th class="right">Bonus</th><th class="right">Deductions</th><th class="right">Other ded.</th><th class="right">Net pay</th><th></th></tr></thead><tbody>' +
+    L.map(function(l, i){
+      return '<tr><td><b>' + esc(l.name) + '</b>' + (l.daysAbsent ? '<div class="muted" style="font-size:11.5px">' + l.daysAbsent + ' unpaid day(s)</div>' : '') + '</td>' +
+        '<td class="right"><div class="pay-lines"><span>' + (l.basis === 'daily' ? 'Days worked' : 'Basic') + ' <b class="mono">' + money(l.basic) + '</b></span>' +
+          (l.allowance ? '<span>' + esc(l.allowanceLabel) + ' <b class="mono">' + money(l.allowance) + '</b></span>' : '') + '</div></td>' +
+        '<td class="right">' + inp(i, 'overtime') + '</td><td class="right">' + inp(i, 'bonus') + '</td>' +
+        '<td class="right"><div class="pay-lines">' +
+          (l.absence ? '<span style="color:var(--danger)">Absence <b class="mono">−' + money(l.absence) + '</b></span>' : '') +
+          (l.pensionEmp ? '<span>Pension <b class="mono">−' + money(l.pensionEmp) + '</b></span>' : '') +
+          (l.advance ? '<span>Advance <b class="mono">−' + money(l.advance) + '</b></span>' : '') +
+          (!l.absence && !l.pensionEmp && !l.advance ? '<span class="muted">—</span>' : '') + '</div></td>' +
+        '<td class="right">' + inp(i, 'otherDed') + '</td>' +
+        '<td class="right mono" style="font-weight:700">' + money(l.net) + '</td>' +
+        '<td><div class="rowacts"><button class="btn ghost tiny" onclick="printPayslip(' + i + ')">Payslip</button></div></td></tr>';
+    }).join('') + '</tbody></table></div>' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">' +
+      (paid ? '<button class="btn ghost" onclick="printPayslip(-1)">Print all payslips</button>'
+        : '<button class="btn ghost" onclick="preparePayroll(true)">Recalculate from attendance</button>' +
+          '<button class="btn ghost" onclick="savePayroll()">Save draft</button>' +
+          '<button class="btn accent" onclick="openPayPayroll()">Mark as paid…</button>' +
+          (r._saved ? '<button class="btn ghost" style="color:var(--danger)" onclick="deletePayroll()">Delete draft</button>' : '')) +
+    '</div>';
+}
+function _payTotals(L){ return L.reduce(function(t, l){ ['gross','net','pensionEmp','pensionEr','advance'].forEach(function(k){ t[k] = _r2(t[k] + (l[k] || 0)); }); return t; }, { gross:0, net:0, pensionEmp:0, pensionEr:0, advance:0 }); }
+async function preparePayroll(keepEdits){
+  const doc = await _loadAtt(_payMonth);
+  const staff = (State.db.employees || []).filter(function(e){ return e.active !== false; });
+  const sum = _attSummary(doc, staff);
+  const prev = {}; ((_payRun && _payRun.lines) || []).forEach(function(l){ prev[l.empId] = { overtime:l.overtime, bonus:l.bonus, otherDed:l.otherDed }; });
+  const lines = staff.map(function(e){ return _calcLine(e, sum, keepEdits ? prev[e.id] : null); });
+  _payRun = Object.assign({ month:_payMonth, status:'draft', lines:lines, _key:_bizUid() + '|' + _payMonth, _saved:!!(_payRun && _payRun._saved) });
+  renderPayroll();
+  if (!staff.some(function(e){ const ps = _hr.staff[e.id]; return ps && (ps.basic || ps.dailyRate); })) toast('Add pay details to staff (Staff tab → edit) to fill in salaries');
+}
+function payEdit(i, f, v){
+  const l = _payRun.lines[i]; l[f] = +v || 0;
+  // recompute totals for this line without touching attendance-based amounts
+  l.gross = _r2(l.basic + l.allowance + (+l.overtime || 0) + (+l.bonus || 0) - l.absence);
+  l.net = _r2(l.gross - l.pensionEmp - l.advance - (+l.otherDed || 0));
+  renderPayroll();
+}
+async function savePayroll(silent){
+  const r = _payRun; if (!r) return false;
+  const data = { month:r.month, status:r.status, lines:r.lines, totals:_payTotals(r.lines), updatedAt:new Date().toISOString(),
+    paidDate:r.paidDate || '', paidMethod:r.paidMethod || '', expenseId:r.expenseId || '' };
+  try { await _bizCol('payroll').doc(r.month).set(data); r._saved = true; if (!silent) toast('Payroll saved'); renderPayroll(); return true; }
+  catch(e) { toast('Could not save payroll: ' + e.message); return false; }
+}
+function deletePayroll(){
+  confirmDel('Delete the draft payroll for ' + _monthLabel(_payMonth) + '?', async function(){
+    try { await _bizCol('payroll').doc(_payMonth).delete(); } catch(e) { return toast(e.message); }
+    _payRun = null; renderPayroll(); toast('Draft deleted');
+  });
+}
+function openPayPayroll(){
+  const t = _payTotals(_payRun.lines);
+  openModal('Mark payroll as paid',
+    '<p style="font-size:13.5px;margin-bottom:10px">' + _monthLabel(_payMonth) + ' — net pay <b>' + money(t.net) + '</b> to ' + _payRun.lines.length + ' staff.</p>' +
+    '<div class="fgrid"><div class="field"><label>Paid on</label><input id="pp_date" type="date" value="' + _localISO() + '"></div>' +
+    '<div class="field"><label>Paid by</label><select id="pp_method"><option value="bank">Bank transfer</option><option value="cash">Cash</option></select></div></div>' +
+    '<label style="display:flex;gap:8px;align-items:center;font-size:13px"><input type="checkbox" id="pp_exp" checked style="width:auto"> Record ' + money(t.gross + t.pensionEr) + ' in Expenses (Salaries &amp; Wages)</label>' +
+    '<p class="muted" style="font-size:12px;margin-top:8px">Advance repayments in this payroll are applied to each staff member’s balance. A paid payroll is locked.</p>',
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:'Mark as paid', cls:'accent', fn:payPayroll}], 'sm');
+}
+async function payPayroll(){
+  const r = _payRun, t = _payTotals(r.lines);
+  r.status = 'paid'; r.paidDate = val('pp_date') || _localISO(); r.paidMethod = val('pp_method');
+  r.lines.forEach(function(l){ (l.advDetail || []).forEach(function(d){ const a = (_hr.advances || []).find(function(x){ return x.id === d.id; }); if (a) a.repaid = _r2((a.repaid || 0) + d.amt); }); });
+  if (document.getElementById('pp_exp') && document.getElementById('pp_exp').checked) {
+    if (!State.db.expenses) State.db.expenses = [];
+    const ex = { id:uid(), date:r.paidDate, category:'Salaries & Wages', desc:'Payroll ' + _monthLabel(r.month) + ' (' + r.lines.length + ' staff)',
+      amount:_r2(t.gross + t.pensionEr), method:r.paidMethod, notes:'Net ' + num(t.net) + ' · staff pension ' + num(t.pensionEmp) + ' · employer pension ' + num(t.pensionEr) };
+    State.db.expenses.push(ex); r.expenseId = ex.id; persist();
+  }
+  closeModal();
+  if (await savePayroll(true)) { await _saveHR(); toast('Payroll marked as paid'); }
+}
+function openPayrollSettings(){
+  const s = _hr.settings;
+  openModal('Payroll settings',
+    '<div class="fgrid">' +
+      '<div class="field"><label>Working days per month</label><input id="ps_wd" type="number" value="' + s.workDays + '"></div>' +
+      '<div class="field"><label>Annual leave days per year</label><input id="ps_al" type="number" value="' + s.annualLeave + '"></div>' +
+      '<div class="field"><label>Pension — staff %</label><input id="ps_pe" type="number" step="0.1" value="' + s.pensionEmp + '"></div>' +
+      '<div class="field"><label>Pension — employer %</label><input id="ps_pr" type="number" step="0.1" value="' + s.pensionEr + '"></div>' +
+      '<div class="field"><label>Late after (clock-in time)</label><input id="ps_late" type="time" value="' + (s.lateAfter || '') + '"></div>' +
+    '</div><p class="muted" style="font-size:12px">Monthly staff lose basic ÷ working days for each absent day, unpaid leave day and half of each half day. Daily-rate staff are paid for days worked plus paid leave.</p>',
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:'Save', cls:'accent', fn:async function(){
+      s.workDays = +val('ps_wd') || 26; s.annualLeave = +val('ps_al') || 30; s.pensionEmp = +val('ps_pe') || 0; s.pensionEr = +val('ps_pr') || 0; s.lateAfter = val('ps_late');
+      await _saveHR(); closeModal(); toast('Payroll settings saved'); if (_payRun && _payRun.status !== 'paid') preparePayroll(true); }}], 'sm');
+}
+function printPayslip(i){
+  const r = _payRun, s = State.db.settings, lines = i < 0 ? r.lines : [r.lines[i]];
+  const row = function(a, b, cls){ return '<tr' + (cls ? ' class="' + cls + '"' : '') + '><td>' + a + '</td><td style="text-align:right">' + b + '</td></tr>'; };
+  const slip = function(l){
+    return '<div class="payslip"><div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #111;padding-bottom:8px;margin-bottom:10px">' +
+      '<div><b style="font-size:17px">' + esc(s.businessName) + '</b><div style="font-size:12px">' + esc(s.address || '') + '</div></div>' +
+      '<div style="text-align:right"><b>PAYSLIP</b><div style="font-size:12px">' + _monthLabel(r.month) + '</div></div></div>' +
+      '<div style="font-size:13px;margin-bottom:10px"><b>' + esc(l.name) + '</b>' + (l.position ? ' — ' + esc(l.position) : '') + '</div>' +
+      '<table style="width:100%;font-size:13px;border-collapse:collapse">' +
+        row(l.basis === 'daily' ? 'Pay for days worked' : 'Basic salary', num(l.basic)) +
+        (l.allowance ? row(esc(l.allowanceLabel), num(l.allowance)) : '') + (l.overtime ? row('Overtime', num(l.overtime)) : '') + (l.bonus ? row('Bonus', num(l.bonus)) : '') +
+        (l.absence ? row('Absence / unpaid leave (' + l.daysAbsent + ' day(s))', '−' + num(l.absence)) : '') +
+        row('<b>Gross pay</b>', '<b>' + num(l.gross) + '</b>', 'tot') +
+        (l.pensionEmp ? row('Pension (MRPS) — staff', '−' + num(l.pensionEmp)) : '') + (l.advance ? row('Salary advance repayment', '−' + num(l.advance)) : '') +
+        (l.otherDed ? row('Other deductions', '−' + num(l.otherDed)) : '') +
+        row('<b>NET PAY (' + esc(s.currencySymbol || 'Rf') + ')</b>', '<b>' + num(l.net) + '</b>', 'net') +
+      '</table>' + (l.pensionEr ? '<div style="font-size:11.5px;margin-top:6px">Employer pension contribution: ' + num(l.pensionEr) + '</div>' : '') +
+      (r.status === 'paid' ? '<div style="font-size:11.5px;margin-top:4px">Paid on ' + fmtDate(r.paidDate) + ' by ' + (r.paidMethod === 'cash' ? 'cash' : 'bank transfer') + '</div>' : '') +
+      '<div style="display:flex;justify-content:space-between;margin-top:34px;font-size:11.5px"><span>Employer signature</span><span>Employee signature</span></div></div>';
+  };
+  const root = document.getElementById('printRoot');
+  root.innerHTML = '<style>.payslip{max-width:640px;margin:0 auto 28px;padding:18px;border:1px solid #ccc;page-break-after:always;font-family:system-ui,sans-serif}.payslip td{padding:5px 0;border-bottom:1px dotted #ccc}.payslip tr.tot td{border-top:1px solid #111}.payslip tr.net td{border-top:2px solid #111;font-size:15px}</style>' + lines.map(slip).join('');
+  window.print();
+}
+
+/* ---------- Advances ---------- */
+function renderAdvances(){
+  const p = document.getElementById('empPanel'); if (!p) return;
+  const list = (_hr.advances || []).slice().sort(function(a, b){ return String(b.date).localeCompare(String(a.date)); });
+  const nm = function(id){ const e = (State.db.employees || []).find(function(x){ return x.id === id; }); return e ? e.name : 'Former staff'; };
+  const outstanding = list.reduce(function(a, x){ return a + Math.max(0, x.amount - (x.repaid || 0)); }, 0);
+  p.innerHTML =
+    '<div class="between" style="margin-bottom:14px;gap:10px;flex-wrap:wrap"><p class="muted" style="font-size:13px">Outstanding advances: <b>' + money(outstanding) + '</b>. Repayments are deducted in payroll.</p>' +
+    '<button class="btn accent" onclick="openAdvanceEditor()">' + svg('plus') + ' Give an advance</button></div>' +
+    (list.length ? '<div class="tbl"><table><thead><tr><th>Staff</th><th>Date</th><th class="right">Amount</th><th class="right">Per payroll</th><th class="right">Repaid</th><th class="right">Balance</th><th></th></tr></thead><tbody>' +
+      list.map(function(a){ const bal = _r2(a.amount - (a.repaid || 0));
+        return '<tr><td><b>' + esc(nm(a.empId)) + '</b>' + (a.note ? '<div class="muted" style="font-size:11.5px">' + esc(a.note) + '</div>' : '') + '</td><td>' + fmtDate(a.date) + '</td>' +
+          '<td class="right mono">' + money(a.amount) + '</td><td class="right mono">' + money(a.installment || a.amount) + '</td><td class="right mono">' + money(a.repaid || 0) + '</td>' +
+          '<td class="right"><span class="pill ' + (bal > 0 ? 'unpaid' : 'paid') + '">' + (bal > 0 ? money(bal) : 'Cleared') + '</span></td>' +
+          '<td><div class="rowacts">' + (bal > 0 ? '<button class="btn ghost tiny" onclick="recordRepayment(\'' + a.id + '\')">Repayment</button>' : '') +
+          (!(a.repaid > 0) ? '<button class="iconbtn" onclick="delAdvance(\'' + a.id + '\')">' + svg('trash') + '</button>' : '') + '</div></td></tr>';
+      }).join('') + '</tbody></table></div>' : emptyBox('No advances', 'Record salary advances here; they are deducted automatically in payroll.'));
+  renderIcons(p);
+}
+function openAdvanceEditor(){
+  const emps = (State.db.employees || []).filter(function(e){ return e.active !== false; });
+  if (!emps.length) return toast('Add staff first');
+  openModal('Give a salary advance',
+    '<div class="field"><label>Staff *</label><select id="ad_emp">' + emps.map(function(e){ return '<option value="' + e.id + '">' + esc(e.name) + '</option>'; }).join('') + '</select></div>' +
+    '<div class="fgrid"><div class="field"><label>Amount *</label><input id="ad_amt" type="number" step="0.01"></div>' +
+    '<div class="field"><label>Date</label><input id="ad_date" type="date" value="' + _localISO() + '"></div>' +
+    '<div class="field"><label>Deduct per payroll</label><input id="ad_inst" type="number" step="0.01" placeholder="Blank = all in next payroll"></div>' +
+    '<div class="field"><label>Note</label><input id="ad_note"></div></div>',
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:'Save advance', cls:'accent', fn:async function(){
+      const amt = +val('ad_amt'); if (!amt || amt <= 0) return toast('Enter the amount');
+      _hr.advances.push({ id:uid(), empId:val('ad_emp'), date:val('ad_date') || _localISO(), amount:_r2(amt), installment:_r2(+val('ad_inst') || amt), repaid:0, note:val('ad_note') });
+      await _saveHR(); closeModal(); renderAdvances(); toast('Advance recorded'); }}], 'sm');
+}
+function recordRepayment(id){
+  const a = _hr.advances.find(function(x){ return x.id === id; }); if (!a) return;
+  const bal = _r2(a.amount - (a.repaid || 0));
+  openModal('Record repayment', '<div class="field"><label>Amount repaid (balance ' + money(bal) + ')</label><input id="rp_amt" type="number" step="0.01" value="' + bal + '"></div>',
+    [{label:'Cancel', cls:'ghost', fn:closeModal}, {label:'Save', cls:'accent', fn:async function(){
+      const v = Math.min(bal, +val('rp_amt') || 0); if (!v) return toast('Enter an amount');
+      a.repaid = _r2((a.repaid || 0) + v); await _saveHR(); closeModal(); renderAdvances(); toast('Repayment recorded'); }}], 'sm');
+}
+function delAdvance(id){ confirmDel('Delete this advance?', async function(){ _hr.advances = _hr.advances.filter(function(a){ return a.id !== id; }); await _saveHR(); renderAdvances(); }); }
+
+/* ============================================================
+   BUY PRO — bank transfer + slip, approved by the platform admin
+   pro_requests/{id}: uid, email, businessName, months, amount, currency, slip (image), ref, status pending|approved|rejected
+   ============================================================ */
+var _myReqs = [], _proSlip = null, _adminReqs = [];
+function _proPrice(months){
+  const c = _platformCfg || {}, m = +c.proPrice || 299;
+  return (months === 12 && +c.proAnnualPrice) ? +c.proAnnualPrice : m * months;
+}
+async function _loadMyRequests(){
+  if (!State.user) return [];
+  try {
+    const s = await _fdb.collection('pro_requests').where('uid', '==', State.user.uid).get();
+    _myReqs = s.docs.map(function(d){ return d.data(); }).sort(function(a, b){ return String(b.createdAt).localeCompare(String(a.createdAt)); });
+  } catch(e) { console.warn('pro requests:', e.message); _myReqs = []; }
+  return _myReqs;
+}
+async function startCheckout(){ openBuyPro(); }
+async function openBuyPro(){
+  if (State.isMember) { closeModal(); toast('Only the business owner can buy Pro — ask them to upgrade.'); return; }
+  openModal('Buy Bizz Master Pro', '<div class="muted" style="padding:12px 2px">Loading…</div>', [{label:'Close', cls:'ghost', fn:closeModal}], 'sm');
+  await _loadMyRequests();
+  const pending = _myReqs.find(function(r){ return r.status === 'pending'; });
+  const last = _myReqs[0], cfg = _platformCfg || {}, sym = cfg.currency || 'Rf';
+  const body = document.querySelector('#modal .modal-body'); if (!body) return;
+  if (pending) {
+    body.innerHTML = '<div class="card" style="padding:14px;background:var(--amber-soft);border-color:var(--amber)"><b>Payment under review</b>' +
+      '<p style="font-size:13px;margin-top:6px">' + pending.months + ' month' + (pending.months > 1 ? 's' : '') + ' · ' + esc(sym) + ' ' + num(pending.amount) + ' · sent ' + fmtDate(String(pending.createdAt).slice(0, 10)) + '</p>' +
+      '<p class="muted" style="font-size:12.5px;margin-top:4px">We will activate Pro as soon as the transfer is confirmed. You will see it here and on your plan badge.</p>' +
+      (pending.slip ? '<img src="' + pending.slip + '" style="max-width:100%;max-height:220px;border-radius:8px;margin-top:8px;border:1px solid var(--line)">' : '') +
+      '<button class="btn ghost sm" style="margin-top:10px;color:var(--danger)" onclick="cancelProRequest(\'' + pending.id + '\')">Cancel this request</button></div>';
+    return;
+  }
+  const periods = [1, 3, 6, 12];
+  body.innerHTML =
+    (last && last.status === 'rejected' ? '<div class="card" style="padding:11px 13px;margin-bottom:12px;background:var(--danger-soft);border-color:var(--danger);font-size:13px"><b>Your last payment was not approved.</b><br>' + esc(last.reason || 'Please check the transfer and try again.') + '</div>' : '') +
+    (_proActive(State.account) ? '<div class="card" style="padding:10px 13px;margin-bottom:12px;background:var(--accent-soft);border-color:var(--accent);font-size:13px">Pro is active until <b>' + fmtDate(State.account.proUntil) + '</b>. A new payment extends it from that date.</div>' : '') +
+    '<div class="field"><label>Period</label><div class="pro-periods">' + periods.map(function(m){
+      return '<label class="pro-period"><input type="radio" name="pro_m" value="' + m + '"' + (m === 12 ? ' checked' : '') + ' onchange="_proAmount()"><b>' + m + ' month' + (m > 1 ? 's' : '') + '</b><span>' + esc(sym) + ' ' + num(_proPrice(m)) + '</span></label>'; }).join('') + '</div></div>' +
+    '<div class="card" style="padding:12px 14px;margin-bottom:12px;background:var(--paper)"><b style="font-size:13px">1. Transfer <span id="pro_amt">' + esc(sym) + ' ' + num(_proPrice(12)) + '</span> to:</b>' +
+      '<div style="white-space:pre-wrap;font-size:13.5px;margin-top:6px" class="mono">' + esc(cfg.payBank || 'Bank details have not been set yet — please contact support.') + '</div>' +
+      (cfg.payBank ? '<button class="btn ghost tiny" style="margin-top:8px" onclick="_copyText(' + JSON.stringify(cfg.payBank).replace(/"/g, '&quot;') + ',\'Bank details copied\')">Copy bank details</button>' : '') + '</div>' +
+    '<b style="font-size:13px">2. Upload the transfer slip</b>' +
+    '<label class="slip-drop" id="pro_drop"><input type="file" accept="image/*" style="display:none" onchange="_proSlipPick(this.files[0])"><span id="pro_slip_lbl">Tap to choose a photo or screenshot of the slip</span><img id="pro_slip_img" style="display:none;max-width:100%;max-height:200px;border-radius:8px;margin-top:8px"></label>' +
+    '<div class="field" style="margin-top:10px"><label>Transfer reference (optional)</label><input id="pro_ref" placeholder="e.g. BML reference number"></div>' +
+    '<button class="btn accent" style="width:100%;margin-top:4px" onclick="submitProRequest()">Submit for approval</button>';
+  _proSlip = null;
+}
+function _proAmount(){
+  const m = +((document.querySelector('input[name="pro_m"]:checked') || {}).value || 12), el = document.getElementById('pro_amt');
+  if (el) el.textContent = ((_platformCfg || {}).currency || 'Rf') + ' ' + num(_proPrice(m));
+}
+function _proSlipPick(file){
+  if (!file) return; if (!file.type.startsWith('image/')) return toast('Please choose an image of the slip');
+  const reader = new FileReader();
+  reader.onload = function(ev){
+    const img = new Image();
+    img.onload = function(){
+      const MAX = 1400; let w = img.width, h = img.height;
+      if (w > MAX || h > MAX) { if (w > h) { h = Math.round(h * MAX / w); w = MAX; } else { w = Math.round(w * MAX / h); h = MAX; } }
+      const cv = document.createElement('canvas'); cv.width = w; cv.height = h; cv.getContext('2d').drawImage(img, 0, 0, w, h);
+      let q = 0.75, data = cv.toDataURL('image/jpeg', q);
+      while (data.length > 700000 && q > 0.3) { q -= 0.1; data = cv.toDataURL('image/jpeg', q); }
+      _proSlip = data;
+      const im = document.getElementById('pro_slip_img'); if (im) { im.src = data; im.style.display = 'block'; }
+      const lb = document.getElementById('pro_slip_lbl'); if (lb) lb.textContent = '\u2713 ' + file.name + ' — tap to change';
+    };
+    img.src = ev.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+async function submitProRequest(){
+  if (!_proSlip) return toast('Please upload the transfer slip');
+  const months = +((document.querySelector('input[name="pro_m"]:checked') || {}).value || 12);
+  const id = 'pr_' + _randCode(16);
+  const req = { id:id, uid:State.user.uid, email:State.user.email || '', businessName:(State.db && State.db.settings.businessName) || '',
+    months:months, amount:_proPrice(months), currency:(_platformCfg || {}).currency || 'Rf', slip:_proSlip, ref:val('pro_ref').trim(),
+    status:'pending', createdAt:new Date().toISOString() };
+  try { await _fdb.collection('pro_requests').doc(id).set(req); }
+  catch(e) { return toast('Could not send: ' + e.message); }
+  _proSlip = null; closeModal(); toast('Payment slip sent — Pro will be activated once it is approved.'); refreshChrome();
+}
+function cancelProRequest(id){
+  confirmDel('Cancel this payment request?', async function(){
+    try { await _fdb.collection('pro_requests').doc(id).delete(); } catch(e) { return toast(e.message); }
+    toast('Request cancelled'); openBuyPro();
+  });
+}
+/* Tell the owner when the admin has approved or rejected their payment */
+async function _checkMyRequests(){
+  if (State.isMember || State.isAdmin) return;
+  await _loadMyRequests();
+  let seen = []; try { seen = JSON.parse(localStorage.getItem('bm_seen_req') || '[]'); } catch(e) {}
+  const news = _myReqs.filter(function(r){ return r.status !== 'pending' && seen.indexOf(r.id + r.status) < 0; });
+  if (!news.length) return;
+  const r = news[0];
+  setTimeout(function(){ toast(r.status === 'approved' ? 'Your Pro payment was approved — Pro is active until ' + fmtDate(r.proUntil) + '.' : 'Your Pro payment was not approved: ' + (r.reason || 'please contact support')); }, 1600);
+  try { localStorage.setItem('bm_seen_req', JSON.stringify(seen.concat(news.map(function(x){ return x.id + x.status; })).slice(-50))); } catch(e) {}
+}
+function _pendingBadge(){ return (State.user && State.user.pendingPay) ? ' (' + State.user.pendingPay + ')' : ''; }
+
+/* ---------- Portal Admin → Payments ---------- */
+async function _loadAdminRequests(){
+  try { const s = await _fdb.collection('pro_requests').get(); _adminReqs = s.docs.map(function(d){ return d.data(); }); }
+  catch(e) { console.warn('admin requests:', e.message); _adminReqs = []; }
+  _adminReqs.sort(function(a, b){ return (a.status === 'pending' ? 0 : 1) - (b.status === 'pending' ? 0 : 1) || String(b.createdAt).localeCompare(String(a.createdAt)); });
+  if (State.user) State.user.pendingPay = _adminReqs.filter(function(r){ return r.status === 'pending'; }).length;
+  return _adminReqs;
+}
+async function renderAdminPayments(){
+  const p = document.getElementById('adminPanel'); if (!p) return;
+  p.innerHTML = '<div class="muted" style="padding:12px">Loading payments…</div>';
+  await _loadAdminRequests();
+  const pill = function(st){ return '<span class="pill ' + ({ pending:'unpaid', approved:'paid', rejected:'overdue' }[st] || 'draft') + '">' + st + '</span>'; };
+  p.innerHTML = '<p class="muted" style="font-size:13px;margin:12px 0">Pro payments sent by users with a bank transfer slip. Approving adds the months to their subscription immediately.</p>' +
+    (_adminReqs.length ? '<div class="tbl"><table><thead><tr><th>Account</th><th>Period</th><th class="right">Amount</th><th>Sent</th><th>Slip</th><th>Status</th><th></th></tr></thead><tbody>' +
+      _adminReqs.map(function(r){
+        return '<tr><td><b>' + esc(r.businessName || '—') + '</b><div class="muted" style="font-size:12px">' + esc(r.email) + '</div></td>' +
+          '<td>' + r.months + ' month' + (r.months > 1 ? 's' : '') + '</td><td class="right mono">' + esc(r.currency || '') + ' ' + num(r.amount) + '</td>' +
+          '<td class="muted">' + fmtDate(String(r.createdAt).slice(0, 10)) + (r.ref ? '<div style="font-size:11.5px">Ref: ' + esc(r.ref) + '</div>' : '') + '</td>' +
+          '<td>' + (r.slip ? '<img src="' + r.slip + '" class="slip-thumb" onclick="viewSlip(\'' + r.id + '\')">' : '—') + '</td>' +
+          '<td>' + pill(r.status) + (r.status === 'approved' && r.proUntil ? '<div class="muted" style="font-size:11.5px">Pro until ' + fmtDate(r.proUntil) + '</div>' : '') + (r.status === 'rejected' && r.reason ? '<div class="muted" style="font-size:11.5px">' + esc(r.reason) + '</div>' : '') + '</td>' +
+          '<td><div class="rowacts">' + (r.status === 'pending' ? '<button class="btn accent tiny" onclick="viewSlip(\'' + r.id + '\')">Review</button>' : '') + '</div></td></tr>';
+      }).join('') + '</tbody></table></div>' : emptyBox('No payments yet', 'When users upload a transfer slip it appears here for approval.'));
+}
+function viewSlip(id){
+  const r = _adminReqs.find(function(x){ return x.id === id; }); if (!r) return;
+  openModal('Payment from ' + esc(r.businessName || r.email),
+    '<div style="font-size:13.5px;margin-bottom:10px">' + esc(r.email) + '<br><b>' + r.months + ' month' + (r.months > 1 ? 's' : '') + ' · ' + esc(r.currency || '') + ' ' + num(r.amount) + '</b>' + (r.ref ? '<br>Reference: ' + esc(r.ref) : '') + '<br><span class="muted">Sent ' + fmtDate(String(r.createdAt).slice(0, 10)) + '</span></div>' +
+    (r.slip ? '<a href="' + r.slip + '" target="_blank" rel="noopener"><img src="' + r.slip + '" style="width:100%;border-radius:10px;border:1px solid var(--line)"></a>' : '<p class="muted">No slip attached.</p>') +
+    (r.status === 'pending' ? '<div class="field" style="margin-top:12px"><label>Reason (only if rejecting)</label><input id="rq_reason" placeholder="e.g. Amount not received"></div>' : ''),
+    r.status === 'pending'
+      ? [{label:'Reject', cls:'ghost', fn:function(){ rejectProRequest(id); }}, {label:'Approve & activate Pro', cls:'accent', fn:function(){ approveProRequest(id); }}]
+      : [{label:'Close', cls:'ghost', fn:closeModal}], 'sm');
+}
+async function approveProRequest(id){
+  const r = _adminReqs.find(function(x){ return x.id === id; }); if (!r) return;
+  let pi = {}; try { const d = await _fdb.collection('plan_info').doc(r.uid).get(); if (d.exists) pi = d.data(); } catch(e) {}
+  const from = _proActive(pi) && pi.proUntil ? pi.proUntil : _localISO(), until = _addMonths(from, r.months);
+  const rec = { id:_randCode(10), type:'subscription', start:from, end:until, months:r.months, amount:r.amount, ref:'Slip' + (r.ref ? ' ' + r.ref : ''), requestId:r.id, addedAt:new Date().toISOString(), by:State.user.email };
+  try {
+    await _fdb.collection('plan_info').doc(r.uid).set({ plan:'pro', proUntil:until, subscriptions:(pi.subscriptions || []).concat([rec]) }, { merge:true });
+    await _fdb.collection('pro_requests').doc(id).update({ status:'approved', proUntil:until, reviewedAt:new Date().toISOString(), reviewedBy:State.user.email });
+  } catch(e) { return toast('Could not approve: ' + e.message); }
+  closeModal(); toast('Approved — Pro active until ' + fmtDate(until)); renderAdminPayments(); refreshChrome();
+}
+async function rejectProRequest(id){
+  const reason = val('rq_reason').trim(); if (!reason) return toast('Enter a reason so the user knows what to fix');
+  try { await _fdb.collection('pro_requests').doc(id).update({ status:'rejected', reason:reason, reviewedAt:new Date().toISOString(), reviewedBy:State.user.email }); }
+  catch(e) { return toast('Could not reject: ' + e.message); }
+  closeModal(); toast('Payment rejected'); renderAdminPayments(); refreshChrome();
+}

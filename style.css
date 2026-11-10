@@ -578,3 +578,64 @@ table{width:100%;border-collapse:collapse}
 @media(max-width:900px){
   #content .tbl tbody td:first-child{flex-direction:column;align-items:flex-start;gap:2px}
 }
+
+/* ---- Shops ---- */
+.shop-chip{display:flex;align-items:center;gap:5px;border:1px solid var(--line);background:var(--card);border-radius:999px;padding:6px 11px;font:600 13px inherit;color:var(--ink);cursor:pointer;max-width:200px;font-family:inherit}
+.shop-chip .shop-nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:600px){.shop-chip{max-width:110px;padding:6px 9px}.shop-chip .shop-ic{display:none}}
+.shop-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,320px),1fr));gap:12px}
+.shop-card{padding:14px 15px}
+.shop-card.closed{opacity:.6}
+.shop-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.shop-stats div{background:var(--paper);border-radius:9px;padding:8px 10px;display:flex;flex-direction:column}
+.shop-stats span{font-size:11px;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.04em;font-weight:700}
+.shop-stats b{font-size:15px;margin-top:2px}
+.stat-box{padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-weight:700;background:var(--paper)}
+.sec-h{font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--ink-soft);margin:14px 0 8px;padding-top:10px;border-top:1px solid var(--line)}
+.sec-h:first-child{margin-top:0;padding-top:0;border-top:none}
+
+/* ---- Attendance ---- */
+.att-list{display:grid;gap:10px}
+.att-card{padding:12px 14px}
+.att-btns{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 8px}
+.att-b{border:1.5px solid var(--line);background:var(--card);border-radius:999px;padding:6px 12px;font:600 12.5px inherit;cursor:pointer;color:var(--ink-soft);font-family:inherit}
+.att-b.on.att-p{background:#e3f2ea;border-color:#1f7a50;color:#1f7a50}
+.att-b.on.att-l{background:var(--amber-soft);border-color:var(--amber);color:var(--amber)}
+.att-b.on.att-h{background:#fff4d6;border-color:#b38600;color:#8a6700}
+.att-b.on.att-a{background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
+.att-b.on.att-lv{background:#e6effd;border-color:var(--blue);color:var(--blue)}
+.att-b.on.att-o{background:#eef0f3;border-color:#5b5d68;color:#5b5d68}
+.att-row{display:flex;flex-wrap:wrap;gap:8px}
+.att-row label{display:flex;flex-direction:column;font-size:11px;font-weight:700;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.04em;gap:3px}
+.att-row label.grow{flex:1;min-width:140px}
+.att-row input,.att-row select{padding:7px 9px;border:1px solid var(--line);border-radius:8px;font-size:13.5px;text-transform:none;letter-spacing:0;font-weight:400}
+
+/* ---- Payroll ---- */
+.pay-in{width:92px;padding:5px 7px;border:1px solid var(--line);border-radius:7px;text-align:right;font-family:'Spline Sans Mono',monospace;font-size:12.5px}
+@media(max-width:900px){.pay-in{width:110px}}
+
+/* ---- Buy Pro ---- */
+.pro-periods{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,120px),1fr));gap:8px}
+.pro-period{display:flex;flex-direction:column;gap:2px;border:1.5px solid var(--line);border-radius:11px;padding:10px 12px;cursor:pointer;position:relative}
+.pro-period input{position:absolute;opacity:0}
+.pro-period:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
+.pro-period span{font-size:12.5px;color:var(--ink-soft)}
+.slip-drop{display:flex;flex-direction:column;align-items:center;justify-content:center;border:2px dashed var(--line);border-radius:12px;padding:16px;margin-top:8px;text-align:center;font-size:13px;color:var(--ink-soft);cursor:pointer}
+.slip-drop:hover{border-color:var(--accent)}
+.slip-thumb{width:44px;height:44px;object-fit:cover;border-radius:7px;border:1px solid var(--line);cursor:zoom-in}
+/* Top bar on phones: the title gives way so the chips and sign-out always fit */
+@media(max-width:600px){
+  .topbar{gap:8px;padding:0 10px}
+  .topbar .page-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .topbar .spacer{display:none}
+  .topbar .biz-chip,.topbar #logoutBtn,.topbar #menuBtn{flex-shrink:0}
+  .topbar .biz-chip{gap:6px}
+  .topbar .shop-chip{flex:0 1 auto;min-width:0;max-width:104px}
+}
+@media(max-width:380px){ .topbar .biz-chip .badge{display:none} }
+.pay-lines{display:flex;flex-direction:column;align-items:flex-end;gap:2px;font-size:12.5px;white-space:nowrap}
+.pay-lines span{color:var(--ink-soft)}
+.pay-lines b{color:var(--ink);font-weight:600}
+@media(min-width:901px){.pay-in{width:80px}}
+.field .pro-period{display:flex;flex-direction:column;gap:2px;margin:0;font-size:14px;font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink)}
+.field .pro-period b{font-size:14px}

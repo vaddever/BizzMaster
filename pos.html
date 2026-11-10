@@ -263,6 +263,7 @@ input{font-family:inherit;font-size:16px;color:var(--ink);outline:none}
       <div class="ph-biz" id="posBiz">POS</div>
       <div class="ph-sub" id="posCashier">Cashier</div>
     </div>
+    <button class="ph-btn" id="clockBtn" onclick="openClock()">\u{1F552} Clock in/out</button>
     <button class="ph-btn" onclick="endSession()">Sign out</button>
   </div>
 
@@ -401,9 +402,31 @@ const _pending = () => { try { return JSON.parse(localStorage.getItem(PEND_KEY)|
 const _setPending = a => { try { localStorage.setItem(PEND_KEY, JSON.stringify(a)); } catch(e) {} };
 const _withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 let _flushing = false;
+// ── Staff clock in / out → attendance in Bizz Master ──
+let _clockedIn = {};
+function openClock() {
+  if (!cashier || !cashier.id) { alert('Sign in with your name first.'); return; }
+  const now = new Date(), p2 = n => String(n).padStart(2, '0');
+  const time = p2(now.getHours()) + ':' + p2(now.getMinutes());
+  const state = _clockedIn[cashier.id];
+  const type = state ? 'out' : 'in';
+  if (!confirm((type === 'in' ? 'Clock IN' : 'Clock OUT') + ' ' + cashier.name + ' at ' + time + '?')) return;
+  const date = now.getFullYear() + '-' + p2(now.getMonth() + 1) + '-' + p2(now.getDate());
+  const clock = { id: 'ck_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), empId: cashier.id, empName: cashier.name,
+    type: type, date: date, time: time, at: now.toISOString(), shopId: ctx.shopId || '' };
+  const p = _pending(); p.push({ token: POS_TOKEN, biz: ctx.businessUid, id: clock.id, clock: clock }); _setPending(p);
+  _clockedIn[cashier.id] = type === 'in' ? time : null;
+  updateClockBtn(); showPendingBadge(); flushPending();
+  alert(cashier.name + (type === 'in' ? ' clocked in at ' : ' clocked out at ') + time);
+}
+function updateClockBtn() {
+  const b = document.getElementById('clockBtn'); if (!b || !cashier) return;
+  const t = _clockedIn[cashier.id];
+  b.textContent = t ? '\u{1F552} Clock out (in ' + t + ')' : '\u{1F552} Clock in';
+}
 function queueSale(txn) {
   const p = _pending();
-  p.push({ token: POS_TOKEN, biz: ctx.businessUid, txn: JSON.parse(JSON.stringify(txn)) });
+  p.push({ token: POS_TOKEN, biz: ctx.businessUid, id: txn.id, txn: JSON.parse(JSON.stringify(txn)) });
   _setPending(p);
   showPendingBadge();
   flushPending();
@@ -415,9 +438,11 @@ async function flushPending() {
     const mine = _pending().filter(x => x.token === POS_TOKEN);
     for (const x of mine) {
       try {
-        await _withTimeout(fdb.collection('businesses').doc(x.biz).collection('posQueue').doc(x.txn.id)
-          .set({ posToken: x.token, txn: x.txn, createdAt: new Date().toISOString() }), 10000);
-        _setPending(_pending().filter(y => y.txn.id !== x.txn.id));
+        const key = x.id || (x.txn && x.txn.id) || (x.clock && x.clock.id);
+        const body = x.clock ? { posToken: x.token, clock: x.clock, createdAt: new Date().toISOString() }
+                             : { posToken: x.token, txn: x.txn, createdAt: new Date().toISOString() };
+        await _withTimeout(fdb.collection('businesses').doc(x.biz).collection('posQueue').doc(key).set(body), 10000);
+        _setPending(_pending().filter(y => (y.id || (y.txn && y.txn.id) || (y.clock && y.clock.id)) !== key));
       } catch(e) { break; }   // offline or not allowed right now — keep it and try again later
     }
   } finally { _flushing = false; }
@@ -450,7 +475,7 @@ setInterval(flushPending, 30000);
       return;
     }
     const d = snap.data();
-    ctx = { businessUid: d.businessUid, items: d.items || [], employees: d.employees || [],
+    ctx = { businessUid: d.businessUid, shopId: d.shopId || '', shopName: d.shopName || '', items: d.items || [], employees: d.employees || [],
       settings: { businessName: d.businessName, logo: d.logo, currencySymbol: d.currencySymbol,
         taxLabel: d.taxLabel, taxRate: d.taxRate, posPrefix: d.posPrefix } };
   } catch(e) { showErr('Could not connect.\n' + e.message); return; }
@@ -526,12 +551,13 @@ function openPOS() {
   document.getElementById('loginView').style.display = 'none';
   document.getElementById('pinView').style.display   = 'none';
   document.getElementById('posView').style.display   = 'flex';
-  document.getElementById('posBiz').textContent     = ctx.settings.businessName || 'POS';
+  document.getElementById('posBiz').textContent     = (ctx.settings.businessName || 'POS') + (ctx.shopName && ctx.shopName !== ctx.settings.businessName ? ' · ' + ctx.shopName : '');
   document.getElementById('posCashier').textContent = 'Cashier: ' + (cashier ? cashier.name : '');
   document.getElementById('taxLabel') &&
     (document.getElementById('taxLabel').textContent =
       (ctx.settings.taxLabel||'Tax') + ' ' + ctx.settings.taxRate + '%');
   cart = []; payMethod = 'cash';
+  updateClockBtn();
   renderItems('');
   updateCart();
 }
@@ -710,7 +736,7 @@ async function confirmSale() {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2,8), number: num,
     date: new Date().toISOString().slice(0,10),
     time: new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}),
-    cashier: cashier?.name || 'Staff',
+    cashier: cashier?.name || 'Staff', shopId: ctx.shopId || '', shopName: ctx.shopName || '',
     customer: document.getElementById('chk_cust').value || 'Walk-in',
     lineItems: JSON.parse(JSON.stringify(cart)),
     totals: {subtotal: t.sub, tax: t.tax, total: t.total, tendered, change: +(tendered-t.total).toFixed(2)},

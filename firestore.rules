@@ -20,6 +20,16 @@ service cloud.firestore {
             && get(/databases/$(database)/documents/members/$(request.auth.uid)).data.ownerUid == bizId));
     }
     function canUseBiz(bizId) { return ownsBiz(bizId) || isTeam(bizId); }
+    // Team member invited with the "Admin" role (can see salaries and payroll)
+    function isTeamAdmin(bizId) {
+      return signedIn() && (
+        (exists(/databases/$(database)/documents/members/$(bizId + '_' + request.auth.uid))
+          && get(/databases/$(database)/documents/members/$(bizId + '_' + request.auth.uid)).data.role == 'admin')
+        || (exists(/databases/$(database)/documents/members/$(request.auth.uid))
+          && get(/databases/$(database)/documents/members/$(request.auth.uid)).data.ownerUid == bizId
+          && get(/databases/$(database)/documents/members/$(request.auth.uid)).data.role == 'admin'));
+    }
+    function canSeePay(bizId) { return ownsBiz(bizId) || isTeamAdmin(bizId); }
     function inviteAllows(code, bizId, ownerUid) {
       let inv = get(/databases/$(database)/documents/invites/$(code)).data;
       return inv.status == 'pending'
@@ -44,11 +54,23 @@ service cloud.firestore {
       // Sales from the staff POS link: staff devices can only ADD a sale, and only with the secret POS token
       match /posQueue/{saleId} {
         allow read, delete: if canUseBiz(bizId);
-        allow create: if request.resource.data.keys().hasOnly(['posToken', 'txn', 'createdAt'])
+        allow create: if request.resource.data.keys().hasOnly(['posToken', 'txn', 'clock', 'createdAt'])
+          && (('txn' in request.resource.data) || ('clock' in request.resource.data))
           && request.resource.data.posToken is string
           && exists(/databases/$(database)/documents/pos_portals/$(request.resource.data.posToken))
           && get(/databases/$(database)/documents/pos_portals/$(request.resource.data.posToken)).data.businessUid == bizId;
       }
+    }
+
+    /* ---------- staff: attendance (all business users) · pay & payroll (owner + team admins) ---------- */
+    match /businesses/{bizId}/attendance/{month} {
+      allow read, write: if canUseBiz(bizId);
+    }
+    match /businesses/{bizId}/hr/{doc} {
+      allow read, write: if canSeePay(bizId);
+    }
+    match /businesses/{bizId}/payroll/{month} {
+      allow read, write: if canSeePay(bizId);
     }
 
     /* ---------- business registry (which account owns which business) ---------- */
@@ -99,6 +121,16 @@ service cloud.firestore {
         && mid == request.resource.data.bizId + '_' + request.auth.uid
         && inviteAllows(request.resource.data.code, request.resource.data.bizId, request.resource.data.ownerUid);
       allow delete: if signedIn() && (resource.data.ownerUid == request.auth.uid || resource.data.get('memberUid', mid) == request.auth.uid);
+    }
+
+    /* ---------- Pro payments by bank transfer slip ---------- */
+    match /pro_requests/{id} {
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.keys().hasOnly(['id', 'uid', 'email', 'businessName', 'months', 'amount', 'currency', 'slip', 'ref', 'status', 'createdAt']);
+      allow read: if signedIn() && (resource.data.uid == request.auth.uid || isPlatformAdmin());
+      allow update: if isPlatformAdmin();
+      allow delete: if isPlatformAdmin() || (signedIn() && resource.data.uid == request.auth.uid && resource.data.status == 'pending');
     }
 
     /* ---------- accounts / subscriptions (plan_info/{accountUid}) ---------- */
